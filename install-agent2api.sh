@@ -24,7 +24,7 @@
 #
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.5.1"
 DEFAULT_IMAGE_REPO="aimodcc/agent2api"
 DEFAULT_TAG="2.7.10"          # 已知可用版本；--tag latest 可跟最新
 DEFAULT_DIR="/opt/agent2api"
@@ -591,10 +591,15 @@ gather_config() {
     info "容器：$CONTAINER    面板端口：$PANEL_PORT    网关端口：$GW_PORT"
     info "域名：${DOMAIN:-（无）}"
     local c; c=$(choose "要做什么？" 1 "重新配置并重启服务" "升级到新版本" "卸载" "退出")
+    # ⚠️ 这里**必须直接调用函数**，不能只设 DO_xxx 标记：
+    # 那些标记是在 main() 开头（本函数之前）就检查过的，现在再设等于没人看 ——
+    # 实测：选「3) 卸载」后脚本照旧往下走，还问「确认开始安装？」。
     case "$c" in
       1) RECONFIG=1 ;;   # 明确要重新配置 → 后面【第 2 步】必须给开关（不能因为状态文件已填满就跳过）
-      2) local t; t=$(ask "要升级到哪个版本（直接回车 = 最新版）" "latest"); IMAGE_TAG="$t"; return 0 ;;
-      3) DO_UNINSTALL=1; return 0 ;;
+      2) local t; t=$(ask "要升级到哪个版本（直接回车 = 最新版）" "latest")
+         IMAGE_TAG_OVERRIDE="$t"
+         do_upgrade; exit $? ;;
+      3) do_uninstall; exit 0 ;;
       4) exit 0 ;;
     esac
   fi

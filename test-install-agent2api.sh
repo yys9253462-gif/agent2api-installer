@@ -281,6 +281,48 @@ case_streaming() {
   verdict $? "端点=$url 首字节=${ttfb}s 总耗时=${total}s 帧数=$frames DONE=$done${why:+ | $why}"
 }
 
+# 交互式菜单：菜单只在 stdin 是终端时出现，所以要用 script(1) 造一个 pty 来喂选项。
+# 这一组是补漏：之前只测了 --uninstall / --upgrade 这两个命令行入口，
+# 没测"重跑后从菜单选"，结果菜单选了「卸载」却继续安装（标记设得太晚、没人看）——
+# 实测踩到，用户报上来的。
+menu_pick() {   # menu_pick <安装目录> <要喂的输入...>
+  local d="$1"; shift
+  local input=""
+  for x in "$@"; do input="${input}${x}
+"; done
+  if command -v script >/dev/null 2>&1; then
+    printf "$input" | timeout 180 script -qec "$INSTALLER --dir $d" /dev/null 2>&1
+  else
+    printf "$input" | timeout 180 "$INSTALLER" --dir "$d" 2>&1
+  fi
+}
+case_menu_uninstall() {
+  begin "重跑菜单选「3) 卸载」→ 真的卸载（以前会继续安装！）"
+  local md mc; md="$(inst mn)"; mc="reg-menu"
+  rm -rf "$md"
+  run_installer --yes --dir "$md" --container "$mc"                 --panel-port "$((P_PORT+40))" --gateway-port "$((G_PORT+40))"
+  [ "$RC" = 0 ] || { verdict 1 "前置安装失败 rc=$RC"; return; }
+  local out; out="$(menu_pick "$md" 3 n)"
+  local gone=0; ctr "$mc" || gone=1
+  { [ "$gone" = 1 ] && printf '%s' "$out" | grep -qF "卸载完成"; }
+  verdict $? "容器已移除=$gone"
+  cleanup_instance "$md" "$mc"
+}
+case_menu_upgrade() {
+  begin "重跑菜单选「2) 升级」→ 走升级流程，不是重装"
+  local md mc; md="$(inst mu)"; mc="reg-menuu"
+  rm -rf "$md"
+  run_installer --yes --dir "$md" --container "$mc"                 --panel-port "$((P_PORT+42))" --gateway-port "$((G_PORT+42))"
+  [ "$RC" = 0 ] || { verdict 1 "前置安装失败 rc=$RC"; return; }
+  local out; out="$(menu_pick "$md" 2 2.8.0)"
+  local okup=0 okno=0
+  printf '%s' "$out" | grep -qF "当前版本" && okup=1
+  printf '%s' "$out" | grep -qF "确认开始安装" || okno=1
+  { [ "$okup" = 1 ] && [ "$okno" = 1 ]; }
+  verdict $? "走了升级路径=$okup 没走安装路径=$okno"
+  cleanup_instance "$md" "$mc"
+}
+
 # ── C. 端口冲突与自动避让 ───────────────────────────────────────────────────
 case_port_conflict_auto() {
   begin "端口被占（当前实例占着 $P_PORT/$G_PORT）→ 自动换端口成功"
@@ -436,6 +478,11 @@ case_install_nodomain; case_rerun_idempotent; case_domains_absent_without_flag; 
 
 printf '\n%s[B2] 状态与版本管理%s\n' "$FG_B" "$FG_O"
 case_status; case_check_update; case_upgrade_same; case_upgrade_rollback
+
+printf '
+%s[B3] 重跑菜单（交互路径）%s
+' "$FG_B" "$FG_O"
+case_menu_uninstall; case_menu_upgrade
 
 printf '\n%s[C] 端口与容器名冲突%s\n' "$FG_B" "$FG_O"
 case_port_conflict_auto; case_container_name_conflict
