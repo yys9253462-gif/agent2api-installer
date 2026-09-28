@@ -24,7 +24,7 @@
 #
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.4.0"
 DEFAULT_IMAGE_REPO="aimodcc/agent2api"
 DEFAULT_TAG="2.7.10"          # 已知可用版本；--tag latest 可跟最新
 DEFAULT_DIR="/opt/agent2api"
@@ -60,7 +60,7 @@ DO_CHECK_UPDATE=0        # --check-update
 DO_STATUS=0              # --status
 IMAGE_TAG_OVERRIDE=""    # --tag 显式指定的目标版本（升级时用它，别被状态文件覆盖）
 NO_DOMAIN=0              # 本次明确不要域名（会摘掉上次写入的站点块）
-ADV_GIVEN=0              # 命令行是否显式给过「高级选项」（目录/容器名/端口/内存/时区/镜像版本）
+RECONFIG=0               # 用户在「检测到已安装」菜单里明确选了「重新配置」→ 必须给高级选项开关
 CADDY_MODE_FORCE=""      # --caddy-mode 强制指定的反代形态
 CADDY_MODE=""           # docker | host | self | nginx | other | none
 CADDY_CONTAINER=""
@@ -117,16 +117,50 @@ ask() {  # ask <提示> <默认值> -> 打印结果
   local prompt="$1" def="$2" ans=""
   if [ "$ASSUME_YES" = 1 ] || [ ! -t 0 ]; then printf '%s' "$def"; return 0; fi
   printf '  %s [%s]: ' "$prompt" "$def" >&2
-  read -r ans || true
+  # read 失败 = EOF / 终端断开，**不是**"用户按了回车"。必须说出来，
+  # 否则用户看到的是"它自己选了个值"，完全不知道发生了什么。
+  if ! IFS= read -r ans; then
+    printf '\n  %s（读不到输入，采用默认值：%s）%s\n' "$C_DIM" "$def" "$C_OFF" >&2
+    printf '%s' "$def"; return 0
+  fi
   printf '%s' "${ans:-$def}"
 }
 ask_yn() {  # ask_yn <提示> <y|n> -> 返回 0=是
   local prompt="$1" def="$2" ans=""
   if [ "$ASSUME_YES" = 1 ] || [ ! -t 0 ]; then [ "$def" = "y" ]; return; fi
   printf '  %s [%s]: ' "$prompt" "$def" >&2
-  read -r ans || true
+  # 🔴 EOF 绝不能当成"回车确认默认值"：确认安装的默认是 y，
+  # 那样输入一断就会**直接开装**。读不到就按「否」处理。
+  if ! IFS= read -r ans; then
+    printf '\n  %s（读不到输入，按「否」处理）%s\n' "$C_DIM" "$C_OFF" >&2
+    return 1
+  fi
   ans="${ans:-$def}"
   case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# 带格式校验的提问：交互模式下**当场重问**，别让用户填错一个字符就得重跑一遍、
+# 把前面 8 个问题全重答一遍（实测体验很差）。非交互/--yes 直接返回默认值，
+# 后面 validate_inputs 仍会兜底。
+ask_port() {  # ask_port <提示> <默认> -> 1-65535 的整数
+  local prompt="$1" def="$2" ans
+  if [ "$ASSUME_YES" = 1 ] || [ ! -t 0 ]; then printf '%s' "$def"; return 0; fi
+  while :; do
+    ans=$(ask "$prompt" "$def")
+    if printf '%s' "$ans" | grep -qE '^[0-9]+$' && [ "$ans" -ge 1 ] && [ "$ans" -le 65535 ]; then
+      printf '%s' "$ans"; return 0
+    fi
+    printf '  %s端口要是 1-65535 之间的数字，请重新输入（或直接回车用 %s）%s\n' "$C_YEL" "$def" "$C_OFF" >&2
+  done
+}
+ask_mem() {  # ask_mem <提示> <默认> -> 形如 256m / 512m / 1g
+  local prompt="$1" def="$2" ans
+  if [ "$ASSUME_YES" = 1 ] || [ ! -t 0 ]; then printf '%s' "$def"; return 0; fi
+  while :; do
+    ans=$(ask "$prompt" "$def")
+    if printf '%s' "$ans" | grep -qE '^[0-9]+[bkmgBKMG]?$'; then printf '%s' "$ans"; return 0; fi
+    printf '  %s内存上限格式形如 256m / 512m / 1g，请重新输入（或直接回车用 %s）%s\n' "$C_YEL" "$def" "$C_OFF" >&2
+  done
 }
 choose() {  # choose <提示> <默认序号> <选项...> -> 只把序号打到 stdout，菜单走 stderr
   local prompt="$1" def="$2"; shift 2
@@ -145,15 +179,24 @@ choose() {  # choose <提示> <默认序号> <选项...> -> 只把序号打到 s
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --dir)          INSTALL_DIR="$2"; ADV_GIVEN=1; shift 2 ;;
-      --tag)          IMAGE_TAG="$2"; IMAGE_TAG_OVERRIDE="$2"; ADV_GIVEN=1; shift 2 ;;
-      --container)    CONTAINER="$2"; ADV_GIVEN=1; shift 2 ;;
+      --dir)          INSTALL_DIR="$2"; shift 2 ;;
+      --tag)          IMAGE_TAG="$2"; IMAGE_TAG_OVERRIDE="$2"; shift 2 ;;
+      --container)    CONTAINER="$2"; shift 2 ;;
       --domain)       DOMAIN="$2"; shift 2 ;;
-      --expose)       EXPOSE_MODE="$2"; shift 2 ;;
-      --panel-port)   PANEL_PORT="$2"; ADV_GIVEN=1; shift 2 ;;
-      --gateway-port) GW_PORT="$2"; ADV_GIVEN=1; shift 2 ;;
-      --mem)          MEM_LIMIT="$2"; ADV_GIVEN=1; shift 2 ;;
-      --tz)           TZ_NAME="$2"; ADV_GIVEN=1; shift 2 ;;
+      --expose)
+        # 非法枚举**在这里就拦下**：以前只在 validate_inputs 里查，而「没绑域名」时
+        # gather_config 会把 EXPOSE_MODE 强制覆盖成 none，于是 `--expose foo`
+        # 被静默吞掉、一个错都不报（实测踩到）。枚举值对不对跟有没有域名无关。
+        EXPOSE_MODE="$2"
+        case "$2" in
+          both|panel|gateway|none) : ;;
+          *) die "--expose 只能是 both / panel / gateway，收到：'$2'" ;;
+        esac
+        shift 2 ;;
+      --panel-port)   PANEL_PORT="$2"; shift 2 ;;
+      --gateway-port) GW_PORT="$2"; shift 2 ;;
+      --mem)          MEM_LIMIT="$2"; shift 2 ;;
+      --tz)           TZ_NAME="$2"; shift 2 ;;
       --cf=*)
         case "${1#--cf=}" in
           y|Y|yes|YES|true|1) BEHIND_CF="y" ;; *) BEHIND_CF="n" ;;
@@ -170,7 +213,15 @@ parse_args() {
       --lock-register)   LOCK_REGISTER="y"; shift ;;
       --with-manager)    MANAGER_INTEGRATE="y"; shift ;;
       --no-manager)      MANAGER_INTEGRATE="n"; shift ;;
-      --caddy-mode)   CADDY_MODE_FORCE="$2"; shift 2 ;;
+      --caddy-mode)
+        # 同上：非法枚举当场拦下。以前这里不校验，decide_caddy_mode 里的 case 匹配不上
+        # 就静默沿用自动探测结果 —— 用户明确指定的形态被无声忽略（实测踩到）。
+        CADDY_MODE_FORCE="$2"
+        case "$2" in
+          docker|host|self) : ;;
+          *) die "--caddy-mode 只能是 docker / host / self，收到：'$2'" ;;
+        esac
+        shift 2 ;;
       --dry-run)      DRY_RUN=1; shift ;;
       --upgrade)      DO_UPGRADE=1; shift ;;
       --check-update) DO_CHECK_UPDATE=1; shift ;;
@@ -479,7 +530,33 @@ UPSTREAM_STYLE=$UPSTREAM_STYLE
 EOF
   chmod 600 "$(state_file)"
 }
-load_state() { [ -f "$(state_file)" ] && . "$(state_file)" && return 0 || return 1; }
+# 状态文件是「KEY=VALUE」纯数据。**绝不 source**：
+#   ① 里面任何一行都会被当 shell 执行 —— 能写这个文件的人等于能以 root 执行任意代码；
+#   ② 文件被写坏时会产生一堆莫名其妙的报错，然后静默回落到默认值（实测踩到）。
+# 这里自己解析：只认白名单里的键，值用 printf -v 赋值（不经过 eval，含空格也安全）。
+load_state() {
+  local f; f="$(state_file)"
+  [ -f "$f" ] || return 1
+  local line key val n=0 bad=0
+  while IFS= read -r line; do
+    case "$line" in ''|'#'*) continue ;; esac
+    case "$line" in
+      *=*) key="${line%%=*}"; val="${line#*=}" ;;
+      *)   bad=1; continue ;;
+    esac
+    case "$key" in
+      INSTALL_DIR|IMAGE_TAG|CONTAINER|PANEL_PORT|GW_PORT|MEM_LIMIT|TZ_NAME|DOMAIN|\
+      EXPOSE_MODE|LOCK_REGISTER|BEHIND_CF|CADDY_MODE|CADDY_CONTAINER|CADDY_FILE|\
+      CADDY_INNER|CADDY_NET|UPSTREAM_STYLE)
+        printf -v "$key" '%s' "$val"; n=$((n+1)) ;;
+      *) bad=1 ;;
+    esac
+  done < "$f"
+  if [ "$bad" = 1 ]; then
+    warn "状态文件 $(basename "$f") 里有无法识别的行，已忽略（不会执行它们）"
+  fi
+  [ "$n" -gt 0 ]
+}
 
 # ── 交互采集配置 ────────────────────────────────────────────────────────────
 gather_config() {
@@ -492,7 +569,7 @@ gather_config() {
     info "域名：${DOMAIN:-（无）}"
     local c; c=$(choose "要做什么？" 1 "重新配置并重启容器" "只升级镜像到新 tag" "卸载" "退出")
     case "$c" in
-      1) : ;;
+      1) RECONFIG=1 ;;   # 明确要重新配置 → 后面【第 2 步】必须给开关（不能因为状态文件已填满就跳过）
       2) local t; t=$(ask "新的镜像 tag" "latest"); IMAGE_TAG="$t"; return 0 ;;
       3) DO_UNINSTALL=1; return 0 ;;
       4) exit 0 ;;
@@ -540,10 +617,14 @@ gather_config() {
   fi
 
   # ── 第 2 步：高级选项。默认**一个都不问** —— 小白不该被问容器名/时区/内存 ──
-  local adv=1
-  # 只在「交互 + 用户没在命令行给过高级参数」时才问这个开关。
-  # ⚠️ 不能用「变量是否为空」判断 —— --dir/状态文件预填都会让它们非空，开关就永远不生效了。
-  if [ "$ASSUME_YES" = 0 ] && [ -t 0 ] && [ "$ADV_GIVEN" = 0 ]; then
+  # 判据是「还有哪些值没定」+「用户是否明确要重新配置」，**不是**「命令行给过参数」：
+  # 早先用 ADV_GIVEN 判断，结果只传一个 --dir 也会被连问 6 个问题（实测踩到）；
+  # 而重跑时状态文件已填满，又会导致开关永远不出现、想改也改不了。
+  local adv=1 missing=0
+  for _v in "$INSTALL_DIR" "$CONTAINER" "$TZ_NAME" "$IMAGE_TAG" "$PANEL_PORT" "$GW_PORT" "$MEM_LIMIT"; do
+    [ -n "$_v" ] || { missing=1; break; }
+  done
+  if [ "$ASSUME_YES" = 0 ] && [ -t 0 ] && { [ "$missing" = 1 ] || [ "$RECONFIG" = 1 ]; }; then
     printf '\n' >&2
     info "【第 2 步】高级选项：安装目录 / 容器名 / 端口 / 内存 / 时区 / 镜像版本"
     info "${C_DIM}  这些默认值都挑好了，一般不用改${C_OFF}"
@@ -580,13 +661,11 @@ gather_config() {
     # 端口：自动避让
     if [ -z "$PANEL_PORT" ]; then
       local auto_panel; auto_panel=$(pick_port "$DEFAULT_PANEL_PORT" "" || echo "$DEFAULT_PANEL_PORT")
-      local ans; ans=$(ask "面板端口（$DEFAULT_PANEL_PORT 被占用时自动从它起找空闲）" "$auto_panel")
-      PANEL_PORT="$ans"
+      PANEL_PORT=$(ask_port "面板端口（$DEFAULT_PANEL_PORT 被占用时自动从它起找空闲）" "$auto_panel")
     fi
     if [ -z "$GW_PORT" ]; then
       local auto_gw; auto_gw=$(pick_port "$DEFAULT_GW_PORT" "$PANEL_PORT" || echo "$DEFAULT_GW_PORT")
-      local ans2; ans2=$(ask "网关端口" "$auto_gw")
-      GW_PORT="$ans2"
+      GW_PORT=$(ask_port "网关端口" "$auto_gw")
     fi
     [ "$PANEL_PORT" != "$GW_PORT" ] || die "面板端口与网关端口不能相同（都是 $PANEL_PORT）"
 
@@ -594,7 +673,7 @@ gather_config() {
     if ! port_free "$PANEL_PORT"; then warn "端口 $PANEL_PORT 已被占用，启动失败时脚本会自动换端口重试"; fi
     if ! port_free "$GW_PORT";    then warn "端口 $GW_PORT 已被占用，启动失败时脚本会自动换端口重试"; fi
 
-    [ -n "$MEM_LIMIT" ] || MEM_LIMIT=$(ask "容器内存上限" "$DEFAULT_MEM")
+    [ -n "$MEM_LIMIT" ] || MEM_LIMIT=$(ask_mem "容器内存上限" "$DEFAULT_MEM")
   fi
 
   # workbuddy-manager 集成（只在交互 + 高级选项开启时问）
@@ -636,24 +715,30 @@ precheck_domain_conflict() {
 prefill_from_saved() {
   local sf="${INSTALL_DIR}/install.conf"
   [ -f "$sf" ] || return 0
-  local line k v reused=0
+  local line k v reused=0 seen=0
   while IFS= read -r line; do
     case "$line" in ''|\#*) continue ;; esac
     k="${line%%=*}"; v="${line#*=}"
     case "$k" in
-      IMAGE_TAG)     if [ -z "$IMAGE_TAG" ];   then IMAGE_TAG="$v";   reused=1; fi ;;
-      CONTAINER)     if [ -z "$CONTAINER" ];   then CONTAINER="$v";   reused=1; fi ;;
-      PANEL_PORT)    if [ -z "$PANEL_PORT" ];  then PANEL_PORT="$v";  reused=1; fi ;;
-      GW_PORT)       if [ -z "$GW_PORT" ];     then GW_PORT="$v";     reused=1; fi ;;
-      MEM_LIMIT)     if [ -z "$MEM_LIMIT" ];   then MEM_LIMIT="$v";   reused=1; fi ;;
-      TZ_NAME)       if [ -z "$TZ_NAME" ];     then TZ_NAME="$v";     reused=1; fi ;;
-      DOMAIN)        if [ "$NO_DOMAIN" != 1 ] && [ -z "$DOMAIN" ]; then DOMAIN="$v"; reused=1; fi ;;
-      EXPOSE_MODE)   if [ -z "$EXPOSE_MODE" ];  then EXPOSE_MODE="$v"; reused=1; fi ;;
-      LOCK_REGISTER) if [ -z "$LOCK_REGISTER" ];then LOCK_REGISTER="$v"; reused=1; fi ;;
-      BEHIND_CF)     if [ -z "$BEHIND_CF" ];   then BEHIND_CF="$v";   reused=1; fi ;;
+      IMAGE_TAG) seen=1;      if [ -z "$IMAGE_TAG" ];   then IMAGE_TAG="$v";   reused=1; fi ;;
+      CONTAINER) seen=1;      if [ -z "$CONTAINER" ];   then CONTAINER="$v";   reused=1; fi ;;
+      PANEL_PORT) seen=1;     if [ -z "$PANEL_PORT" ];  then PANEL_PORT="$v";  reused=1; fi ;;
+      GW_PORT) seen=1;        if [ -z "$GW_PORT" ];     then GW_PORT="$v";     reused=1; fi ;;
+      MEM_LIMIT) seen=1;      if [ -z "$MEM_LIMIT" ];   then MEM_LIMIT="$v";   reused=1; fi ;;
+      TZ_NAME) seen=1;        if [ -z "$TZ_NAME" ];     then TZ_NAME="$v";     reused=1; fi ;;
+      DOMAIN) seen=1;         if [ "$NO_DOMAIN" != 1 ] && [ -z "$DOMAIN" ]; then DOMAIN="$v"; reused=1; fi ;;
+      EXPOSE_MODE) seen=1;    if [ -z "$EXPOSE_MODE" ];  then EXPOSE_MODE="$v"; reused=1; fi ;;
+      LOCK_REGISTER) seen=1;  if [ -z "$LOCK_REGISTER" ];then LOCK_REGISTER="$v"; reused=1; fi ;;
+      BEHIND_CF) seen=1;      if [ -z "$BEHIND_CF" ];   then BEHIND_CF="$v";   reused=1; fi ;;
     esac
   done < "$sf"
-  [ "$reused" = 1 ] && info "已读回上次的配置作为默认值（命令行显式给出的以命令行为准）"
+  if [ "$reused" = 1 ]; then
+    info "已读回上次的配置作为默认值（命令行显式给出的以命令行为准）"
+  elif [ "$seen" = 0 ] && [ -s "$sf" ]; then
+    # 文件有内容却一个可用键都没有 → 多半被改坏了。必须说出来，
+    # 否则用户会看到"它按默认值装了另一个容器"却不知道为什么（实测踩到）。
+    warn "状态文件 $(basename "$sf") 里没有可识别的配置（可能被改坏了），将按默认值处理"
+  fi
   return 0
 }
 
@@ -738,6 +823,28 @@ validate_inputs() {
   # 内存上限：形如 256m / 512m / 1g
   if ! printf '%s' "$MEM_LIMIT" | grep -qE '^[0-9]+[bkmgBKMG]?$'; then
     problem "内存上限格式不对（示例 256m / 512m / 1g）：'$MEM_LIMIT'"; bad=1
+  else
+    # 光看格式不够：0m / 1k 都"合法"，但 docker 的最低内存限制是 6MB，
+    # 交给 docker 会得到一个很难懂的报错。这里提前拦下（实测 --mem 0m 曾被放过去）。
+    local _n _u _mb
+    _n=$(printf '%s' "$MEM_LIMIT" | sed -E 's/^([0-9]+).*/\1/')
+    _u=$(printf '%s' "$MEM_LIMIT" | sed -E 's/^[0-9]+([bkmgBKMG]?)$/\1/' | tr 'A-Z' 'a-z')
+    case "$_u" in
+      g) _mb=$((_n * 1024)) ;;
+      m|'') _mb=$_n ;;
+      k) _mb=$((_n / 1024)) ;;
+      b) _mb=0 ;;
+    esac
+    if [ "$_mb" -lt 6 ]; then
+      problem "内存上限太小：'$MEM_LIMIT'（docker 最低 6m；实际使用建议 256m 以上）"; bad=1
+    fi
+  fi
+
+  # --no-domain 与 --domain 同时给：语义矛盾，必须直接报错。
+  # （实测：两个都给时，脚本一边把域名写进配置、一边又按「不绑域名」处理，输出自相矛盾）
+  if [ "$NO_DOMAIN" = 1 ] && [ -n "$DOMAIN" ]; then
+    problem "--no-domain 与 --domain 不能同时使用（一个说不要域名、一个给了域名）"
+    bad=1
   fi
 
   # 镜像 tag / 容器名：按 docker 的字符集
@@ -757,9 +864,15 @@ validate_inputs() {
   fi
 
   # 暴露网关但不暴露面板时，面板就没入口了 —— 注册管理员得靠隧道，明确告知
+  # （这里只需要隧道面板：网关本身是公网可达的。命令里的 IP/用户名都填好，别留占位符）
   if [ -n "$DOMAIN" ] && [ "$EXPOSE_MODE" = "gateway" ]; then
-    warn "只暴露了 /v1 网关，面板不在域名上。注册管理员/加账号请用 SSH 隧道："
-    info "    ssh -N -L ${PANEL_PORT}:127.0.0.1:${PANEL_PORT} <本机>  → http://127.0.0.1:${PANEL_PORT}"
+    local _h _u
+    _h=$(host_public_ip || true); [ -n "$_h" ] || _h="<你的服务器IP>"
+    _u="${SUDO_USER:-}"; [ -n "$_u" ] || _u="$(id -un 2>/dev/null || echo root)"
+    warn "只暴露了 /v1 网关，面板没有公网入口 —— 注册管理员 / 加账号要走 SSH 隧道："
+    printf '      %sssh -N -L %s:127.0.0.1:%s %s@%s%s\n' "$C_DIM" "$PANEL_PORT" "$PANEL_PORT" "$_u" "$_h" "$C_OFF"
+    printf '      然后浏览器打开 %shttp://127.0.0.1:%s%s\n' "$C_BLD" "$PANEL_PORT" "$C_OFF"
+    info "${C_DIM}（网关本身公网可达、不用隧道；只有面板需要）${C_OFF}"
   fi
 
   [ "$bad" = 0 ] || die "上面几项参数不合法，已中止（未做任何改动）。"

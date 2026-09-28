@@ -143,6 +143,52 @@ case_dryrun_no_side_effect() {
 
 # ── B. 默认值路径（无域名安装）──────────────────────────────────────────────
 C="reg-nodom"; D=""
+case_bad_expose_no_domain() {
+  begin "--expose 非法值【不带域名】时也要拦（以前会被静默吞掉）"
+  # 不带 --domain 时 gather_config 会把 EXPOSE_MODE 强制覆盖成 none，
+  # 于是非法值被无声吃掉、一个错都不报 —— 实测踩到
+  run_installer --dry-run -y --dir "$(inst bx)" --expose foo
+  { [ "$RC" != 0 ] && has_re "只能"; }
+  verdict $? "rc=$RC"
+}
+case_conflict_no_domain_and_domain() {
+  begin "--no-domain 与 --domain 同时给 → 直接报错（语义矛盾）"
+  run_installer --dry-run -y --dir "$(inst bc)" --no-domain --domain x.example.com
+  { [ "$RC" != 0 ] && has_re "不能同时"; }
+  verdict $? "rc=$RC"
+}
+case_mem_too_small() {
+  begin "--mem 0m / 1k 被拦下（低于 docker 的 6m 下限）"
+  run_installer --dry-run -y --dir "$(inst bm)" --mem 0m
+  local r1=$RC
+  run_installer --dry-run -y --dir "$(inst bm)" --mem 1k
+  local r2=$RC
+  { [ "$r1" != 0 ] && [ "$r2" != 0 ]; }
+  verdict $? "0m→rc=$r1  1k→rc=$r2"
+}
+case_bad_caddy_mode() {
+  begin "--caddy-mode 非法值被拦下（以前会被静默忽略）"
+  run_installer --dry-run -y --dir "$(inst bd)" --caddy-mode bogus
+  { [ "$RC" != 0 ] && has_re "caddy-mode"; }
+  verdict $? "rc=$RC"
+}
+case_corrupt_state_file() {
+  begin "状态文件被写坏 → 明确提示，且【不执行】里面的内容"
+  [ -f "$D/install.conf" ] || { skip "无实例"; return; }
+  local bak; bak="$(mktemp)"; cp "$D/install.conf" "$bak"
+  printf 'garbage line
+EVIL=$(touch /tmp/.a2a-pwned)
+' > "$D/install.conf"
+  rm -f /tmp/.a2a-pwned
+  run_installer --dry-run -y --dir "$D"
+  local warned=0 pwned=0
+  has "可识别" && warned=1
+  [ -f /tmp/.a2a-pwned ] && pwned=1
+  cp "$bak" "$D/install.conf"; rm -f "$bak" /tmp/.a2a-pwned
+  { [ "$warned" = 1 ] && [ "$pwned" = 0 ]; }
+  verdict $? "有提示=$warned 被注入=$pwned"
+}
+
 case_install_nodomain() {
   begin "无域名安装：容器 healthy、面板/网关在容器内均可达"
   D="$(inst $C)"; rm -rf "$D"
@@ -379,8 +425,14 @@ case_help; case_unknown_arg; case_bad_port_alpha; case_bad_port_range
 case_same_ports; case_bad_expose; case_bad_mem; case_bad_container
 case_rel_dir; case_dryrun_no_side_effect
 
+printf '
+%s[A2] 边界与异常（防退化）%s
+' "$FG_B" "$FG_O"
+case_bad_expose_no_domain; case_conflict_no_domain_and_domain
+case_mem_too_small; case_bad_caddy_mode
+
 printf '\n%s[B] 默认值路径与幂等%s\n' "$FG_B" "$FG_O"
-case_install_nodomain; case_rerun_idempotent; case_domains_absent_without_flag
+case_install_nodomain; case_rerun_idempotent; case_domains_absent_without_flag; case_corrupt_state_file
 
 printf '\n%s[B2] 状态与版本管理%s\n' "$FG_B" "$FG_O"
 case_status; case_check_update; case_upgrade_same; case_upgrade_rollback
