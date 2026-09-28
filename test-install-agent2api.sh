@@ -323,6 +323,25 @@ case_menu_upgrade() {
   cleanup_instance "$md" "$mc"
 }
 
+case_no_deps_flag() {
+  begin "--no-deps：缺 docker 时只给命令、不擅自装（保护用户系统）"
+  # 用 PATH 把 docker 藏起来，模拟"机器上没有 docker"
+  local fake; fake="$(mktemp -d)"
+  local i
+  for i in /usr/bin/* /bin/* /usr/local/bin/*; do
+    b=$(basename "$i"); [ "$b" = "docker" ] && continue
+    ln -sf "$i" "$fake/$b" 2>/dev/null
+  done
+  local out rc
+  out=$(env PATH="$fake" "$INSTALLER" --dry-run --yes --no-deps --dir "$(inst nd)" 2>&1); rc=$?
+  rm -rf "$fake"
+  local told=0 notinst=0
+  printf '%s' "$out" | grep -qF "get.docker.com" && told=1
+  printf '%s' "$out" | grep -qF "自动帮你装" && notinst=1
+  { [ "$rc" != 0 ] && [ "$told" = 1 ] && [ "$notinst" = 1 ]; }
+  verdict $? "rc=$rc 给了命令=$told 提示可自动装=$notinst"
+}
+
 # ── C. 端口冲突与自动避让 ───────────────────────────────────────────────────
 case_port_conflict_auto() {
   begin "端口被占（当前实例占着 $P_PORT/$G_PORT）→ 自动换端口成功"
@@ -471,6 +490,7 @@ printf '
 %s[A2] 边界与异常（防退化）%s
 ' "$FG_B" "$FG_O"
 case_bad_expose_no_domain; case_conflict_no_domain_and_domain
+case_no_deps_flag
 case_mem_too_small; case_bad_caddy_mode
 
 printf '\n%s[B] 默认值路径与幂等%s\n' "$FG_B" "$FG_O"

@@ -24,7 +24,7 @@
 #
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.7.0"
 DEFAULT_IMAGE_REPO="aimodcc/agent2api"
 DEFAULT_TAG="2.7.10"          # 已知可用版本；--tag latest 可跟最新
 DEFAULT_DIR="/opt/agent2api"
@@ -51,6 +51,7 @@ EXPOSE_MODE=""          # both | panel | gateway | none
 LOCK_REGISTER=""
 BEHIND_CF=""
 MANAGER_INTEGRATE=""
+AUTO_DEPS=1               # 缺依赖自动装（--no-deps 关掉）
 DRY_RUN=0
 ASSUME_YES=0
 DO_UNINSTALL=0
@@ -266,6 +267,7 @@ parse_args() {
       --check-update) DO_CHECK_UPDATE=1; shift ;;
       --status)       DO_STATUS=1; shift ;;
       --skip-dns-check) SKIP_DNS_CHECK=1; shift ;;
+      --no-deps)      AUTO_DEPS=0; shift ;;      # 别动我的系统，缺什么我自己装
       -y|--yes)       ASSUME_YES=1; shift ;;
       --uninstall)    DO_UNINSTALL=1; shift ;;
       --no-domain)    NO_DOMAIN=1; DOMAIN=""; shift ;;
@@ -303,6 +305,7 @@ agent2api 一键安装器 v$SCRIPT_VERSION
   --check-update          查询 Docker Hub 上是否有新版本
   --upgrade               升级到最新版（可配合 --tag 指定版本）；健康复检不过自动回滚
   --skip-dns-check        跳过「域名是否解析到本机」的校验（走 CDN 回源时需要）
+  --no-deps               不要自动装依赖（缺 docker 时只给命令，不替你装）
   -y, --yes               全部用默认值，不交互
   --uninstall             卸载（停容器、可选删目录、移除站点块）
   -h, --help              显示本帮助
@@ -321,31 +324,195 @@ need_root() {
   fi
 }
 
-check_docker() {
-  # 新手在新 VPS 上撞的第一堵墙就是"没装 docker"。只说"请先安装 Docker"是没用的 ——
-  # 得把**能直接粘的命令**给出来。
-  if ! command -v docker >/dev/null 2>&1; then
+# ── 自动装依赖 ──────────────────────────────────────────────────────────────
+# 一键脚本就该真的"一键"：缺什么自己装，而不是让用户自己去敲命令（实测被用户吐槽）。
+# docker 三种装法依次降级：官方脚本 → 官方脚本+阿里云镜像 → 发行版自带仓库。
+# 不想让脚本动系统的可以加 --no-deps（那就退回"给出可粘命令"的老行为）。
+PKG_MGR=""
+detect_pkg_mgr() {
+  local m
+  for m in apt-get dnf yum apk zypper; do
+    command -v "$m" >/dev/null 2>&1 && { PKG_MGR="$m"; return 0; }
+  done
+  return 1
+}
+pkg_install() {   # pkg_install <包...>；失败返回非 0
+  case "$PKG_MGR" in
+    apt-get) DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" ;;
+    dnf|yum) "$PKG_MGR" install -y "$@" ;;
+    apk)     apk add --no-cache "$@" ;;
+    zypper)  zypper --non-interactive install "$@" ;;
+    *)       return 1 ;;
+  esac
+}
+# 取一个 URL 到文件（curl 或 wget 都行）
+fetch_to() {   # fetch_to <url> <目标文件>
+  if command -v curl >/dev/null 2>&1; then curl -fsSL --max-time 180 -o "$2" "$1"
+  elif command -v wget >/dev/null 2>&1; then wget -q -T 180 -O "$2" "$1"
+  else return 1; fi
+}
+
+ensure_docker() {
+  command -v docker >/dev/null 2>&1 && return 0
+
+  # --no-deps：不碰用户系统，退回"给命令让用户自己装"
+  if [ "$AUTO_DEPS" != 1 ]; then
     problem "这台机器上还没装 docker（跑这个服务必须用它）"
-    info "装它很简单，把下面这行粘进去回车就行（官方一键脚本）："
+    info "自己装的话，把下面这行粘进去回车就行："
     printf '      %scurl -fsSL https://get.docker.com | sh%s\n' "$C_BLD" "$C_OFF"
-    info "${C_DIM}装完再重新跑本脚本即可。${C_OFF}"
-    die "缺少 docker，已中止（未做任何改动）。"
+    info "${C_DIM}（或者去掉 --no-deps 重跑，脚本会自动帮你装）${C_OFF}"
+    return 1
   fi
-  if ! docker info >/dev/null 2>&1; then
-    problem "docker 装了，但连不上它的后台服务"
-    info "多半是服务没在跑，试这条："
-    printf '      %ssystemctl start docker && systemctl enable docker%s\n' "$C_BLD" "$C_OFF"
-    info "${C_DIM}（如果是权限问题，请用 root 或加 sudo 重跑本脚本）${C_OFF}"
-    die "docker 不可用，已中止（未做任何改动）。"
+
+  warn "这台机器上还没装 docker —— 我来装（跑服务必须用它，大概 1-2 分钟，别急）"
+  printf '\n'
+
+  # 得先有下载工具
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    if detect_pkg_mgr; then
+      info "先装个下载工具（curl）…"
+      pkg_install curl >/dev/null 2>&1 || true
+    fi
   fi
-  if docker compose version >/dev/null 2>&1; then DC=(docker compose)
-  elif command -v docker-compose >/dev/null 2>&1; then DC=(docker-compose)
+
+  local script=/tmp/agent2api-get-docker.sh log=/tmp/agent2api-docker-install.log ok=0
+  rm -f "$script" "$log"
+
+  # 🔴 判定标准必须是「docker 命令是否真的可用」，**不能看脚本退出码**。
+  # 实测：包已装、二进制却被删掉时，get.docker.com 会退出 0 却什么都不装
+  #（apt 认为"已是最新版"，直接跳过）—— 信退出码就会误判成功、不走进降级分支。
+  docker_ok() { command -v docker >/dev/null 2>&1; }
+
+  # 方式 1：官方一键脚本
+  if fetch_to https://get.docker.com "$script" 2>/dev/null && [ -s "$script" ]; then
+    info "方式 1/4：docker 官方一键脚本"
+    sh "$script" >"$log" 2>&1 || true
+    docker_ok && ok=1
+
+    # 方式 2：官方脚本 + 阿里云镜像（国内网络通常更快/更通）
+    if [ "$ok" != 1 ]; then
+      info "方式 2/4：官方脚本 + 阿里云镜像"
+      sh "$script" --mirror Aliyun >"$log" 2>&1 || true
+      docker_ok && ok=1
+    fi
   else
-    problem "docker 装了，但缺 compose 插件（用来编排服务）"
-    info "用上面那条官方脚本装的 docker 一般自带；也可以单独装："
-    printf '      %sapt install -y docker-compose-plugin%s\n' "$C_BLD" "$C_OFF"
-    die "缺少 docker compose，已中止（未做任何改动）。"
+    info "方式 1/4：官方脚本没下下来（网络受限？），换本地仓库"
   fi
+
+  # 方式 3：发行版自带仓库
+  if [ "$ok" != 1 ] && detect_pkg_mgr; then
+    info "方式 3/4：用 ${PKG_MGR} 装发行版自带的 docker"
+    case "$PKG_MGR" in
+      apt-get) pkg_install docker.io >"$log" 2>&1 || true ;;
+      apk)     pkg_install docker >"$log" 2>&1 || true ;;
+      *)       pkg_install docker >"$log" 2>&1 || true ;;
+    esac
+    docker_ok && ok=1
+  fi
+
+  # 方式 4：重装（专门对付「dpkg 说已安装、二进制却缺失/损坏」这种坏状态 ——
+  # 普通 install 在这种情况下什么都不会做）
+  if [ "$ok" != 1 ] && detect_pkg_mgr; then
+    info "方式 4/4：重装 docker 包（包状态可能是坏的）"
+    case "$PKG_MGR" in
+      apt-get) pkg_install --reinstall docker-ce docker-ce-cli containerd.io >"$log" 2>&1 || true
+               docker_ok || pkg_install --reinstall docker.io >"$log" 2>&1 || true ;;
+      apk)     pkg_install --force-broken-world docker >"$log" 2>&1 || true ;;
+      *)       pkg_install --reinstall docker >"$log" 2>&1 || true ;;
+    esac
+    docker_ok && ok=1
+  fi
+
+  if ! docker_ok; then
+    problem "自动装 docker 没成功（四种方式都试过了）"
+    if [ -s "$log" ]; then
+      info "失败日志最后几行（完整日志：$log）："
+      tail -6 "$log" | sed 's/^/      /' >&2
+    fi
+    info "如果之前手动删过 docker 的文件，可能 dpkg 状态坏了，试试先卸干净再装："
+    printf '      %sapt purge -y docker-ce docker-ce-cli containerd.io && curl -fsSL https://get.docker.com | sh%s\n' "$C_BLD" "$C_OFF"
+    return 1
+  fi
+  ok "docker 装好了（$(docker --version 2>/dev/null | cut -c1-40)）"
+  return 0
+}
+
+ensure_docker_running() {
+  docker info >/dev/null 2>&1 && return 0
+  warn "docker 装了，但服务没在跑 —— 帮你启起来"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl start docker >/dev/null 2>&1 || true
+    systemctl enable docker >/dev/null 2>&1 || true
+  elif command -v service >/dev/null 2>&1; then
+    service docker start >/dev/null 2>&1 || true
+  fi
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    docker info >/dev/null 2>&1 && { ok "docker 服务已启动"; return 0; }
+    sleep 1
+  done
+  problem "docker 服务起不来"
+  info "看看它为什么起不来：journalctl -u docker --no-pager -n 20"
+  return 1
+}
+
+ensure_compose() {
+  if docker compose version >/dev/null 2>&1; then DC=(docker compose); return 0; fi
+  if command -v docker-compose >/dev/null 2>&1; then DC=(docker-compose); return 0; fi
+
+  if [ "$AUTO_DEPS" != 1 ]; then
+    problem "缺 docker compose（用来编排服务）"
+    info "装一个：apt install -y docker-compose-plugin（或对应发行版的包名）"
+    return 1
+  fi
+
+  warn "缺 docker compose —— 我来装"
+  # 1) 包管理器
+  if detect_pkg_mgr; then
+    case "$PKG_MGR" in
+      apt-get) pkg_install docker-compose-plugin >/dev/null 2>&1 \
+                 || pkg_install docker-compose-v2 >/dev/null 2>&1 \
+                 || pkg_install docker-compose >/dev/null 2>&1 || true ;;
+      *)       pkg_install docker-compose-plugin >/dev/null 2>&1 \
+                 || pkg_install docker-compose >/dev/null 2>&1 || true ;;
+    esac
+    docker compose version >/dev/null 2>&1 && { DC=(docker compose); ok "compose 装好了"; return 0; }
+    command -v docker-compose >/dev/null 2>&1 && { DC=(docker-compose); ok "compose 装好了"; return 0; }
+  fi
+
+  # 2) 直接下 compose 插件二进制（最通用，不依赖包管理器）
+  local dir=/usr/local/lib/docker/cli-plugins ver arch tmp
+  mkdir -p "$dir"
+  tmp=$(mktemp)
+  ver=""
+  if fetch_to https://api.github.com/repos/docker/compose/releases/latest "$tmp" 2>/dev/null; then
+    ver=$(grep -o '"tag_name": *"[^"]*"' "$tmp" 2>/dev/null | head -1 | cut -d'"' -f4)
+  fi
+  rm -f "$tmp"
+  [ -n "$ver" ] || ver="v2.29.7"          # 查不到就用一个已知可用的版本
+  arch=$(uname -m)
+  case "$arch" in x86_64|amd64) arch=x86_64 ;; aarch64|arm64) arch=aarch64 ;; esac
+  if fetch_to "https://github.com/docker/compose/releases/download/${ver}/docker-compose-linux-${arch}" "$dir/docker-compose" 2>/dev/null \
+     && [ -s "$dir/docker-compose" ]; then
+    chmod +x "$dir/docker-compose"
+    docker compose version >/dev/null 2>&1 && { DC=(docker compose); ok "compose 装好了（${ver}）"; return 0; }
+  fi
+
+  problem "compose 没装上"
+  info "手动装一次再重跑：apt install -y docker-compose-plugin"
+  return 1
+}
+
+check_docker() {
+  # ⚠️ 只在"真的要装/升级"时才自动装依赖。
+  # 查状态/卸载/查更新时自动装 docker 是反直觉的 —— 用户说"卸载"，脚本却给他装了个 docker
+  # 出来（实测踩到：我的测试命令里先跑 --uninstall，结果它把 docker 装回来了）。
+  case "${DO_STATUS}${DO_UNINSTALL}${DO_CHECK_UPDATE}" in
+    *1*) AUTO_DEPS=0 ;;
+  esac
+  ensure_docker         || die "缺少 docker，已中止（未做任何改动）。"
+  ensure_docker_running || die "docker 不可用，已中止（未做任何改动）。"
+  ensure_compose        || die "缺少 docker compose，已中止（未做任何改动）。"
   ok "docker 已就绪（跑服务要用的容器工具，不用你管）"
 }
 

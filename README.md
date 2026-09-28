@@ -146,6 +146,10 @@ curl -fsSL "https://pan.ailxw.com/api/pickup-download?code=20818" -o ~/a2a.sh \
 ════════════════════════════════════════════════════════
 ```
 
+> **依赖自动装**：机器上没有 docker / docker compose 时，脚本**自己装**（官方脚本 → 阿里云镜像 → 发行版仓库 →
+> 重装包，四种方式依次降级），而不是让你自己去敲命令。实测在一台被卸干净的 Debian 12 上，从「没有 docker」到
+> 装完 agent2api 总共约 60 秒。不想让脚本动系统的加 `--no-deps`。
+>
 > **不再假设你懂术语**：输出里"宿主 Caddy / systemd / 反代后端 / Caddyfile"这类词都换成了人话
 > （"这台机器上已有网页服务器"、"配置文件已自动备份，不影响现有网站"）；
 > 提问里的"镜像 tag / 容器名 / 注册封锁"改成"版本 / 服务名字 / 要不要禁止别人自己注册"。
@@ -234,7 +238,7 @@ ssh -N a2a
 | --- | --- | --- |
 | `sudo: command not found` 后面跟 `curl: (23) Failed writing body` | 你**登录就是 root**，而这台机器**没装 sudo** | 去掉 `sudo`，直接 `bash ~/a2a.sh`。先看提示符是 `#`（root）还是 `$`（普通用户） |
 | 粘上去**一点输出都没有**，光标直接回来 | 下载源不通（`curl -fsSL … \| bash` 的失败是**无声的**） | 换源（见上面三个源），或改用 `-o 文件 && bash 文件` 的写法 |
-| `docker: command not found` | 机器上还没装 Docker | 脚本会直接把 `curl -fsSL https://get.docker.com \| sh` 打印给你，粘上去就行 |
+| `docker: command not found` | 机器上还没装 Docker | **脚本会自动帮你装**（不用管）；加了 `--no-deps` 时才只打印命令给你 |
 | 隧道命令报 `Permission denied` | 你平时不是用密码登录这台机器（配了别名/密钥） | 把你平时那条 ssh 命令后面加上 `-N -L 面板端口:127.0.0.1:面板端口 -L 网关端口:127.0.0.1:网关端口` |
 | `需要 root 权限运行…` | 你是普通用户 | 按提示把 `bash` 换成 `sudo bash` |
 | `80/443 被 xxx 占用` | 机器上已有反代（Nginx 等）在跑 | 脚本会打印可直接粘贴的 Nginx 片段；或腾出 80/443 后用 `--caddy-mode self` |
@@ -279,6 +283,7 @@ sudo bash install-agent2api.sh --uninstall
 | `--lock-register` / `--open-register` | 是否封掉公网自助注册（**默认不封**） |
 | `--with-manager` / `--no-manager` | 是否登记为已有 workbuddy-manager 的上游 |
 | `--skip-dns-check` | 跳过「域名是否解析到本机」校验（走 CDN 回源时用） |
+| `--no-deps` | **不要自动装依赖**（默认会自动装 docker / compose） |
 | `--dry-run` / `-y` / `--uninstall` | 预演 / 全默认不交互 / 卸载 |
 
 ---
