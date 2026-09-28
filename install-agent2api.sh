@@ -24,7 +24,7 @@
 #
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.5.0"
 DEFAULT_IMAGE_REPO="aimodcc/agent2api"
 DEFAULT_TAG="2.7.10"          # 已知可用版本；--tag latest 可跟最新
 DEFAULT_DIR="/opt/agent2api"
@@ -88,7 +88,9 @@ on_signal() {
       printf '  %s×%s 还原后校验/重载未通过，请手工检查 %s\n' "$C_RED" "$C_OFF" "$CADDY_FILE" >&2
     fi
   fi
-  printf '  已中止。容器若已创建，可用 --uninstall 清理。\n' >&2
+  printf '  %s已中止。%s\n' "$C_YEL" "$C_OFF" >&2
+  printf '  %s配置已还原到你运行前的状态，没有改坏任何东西。%s\n' "$C_DIM" "$C_OFF" >&2
+  printf '  %s（如果之前已经装好过、这次只是重跑：服务还在，重跑一次脚本就能接着用）%s\n' "$C_DIM" "$C_OFF" >&2
   exit 130
 }
 trap on_signal INT TERM
@@ -283,12 +285,31 @@ need_root() {
 }
 
 check_docker() {
-  command -v docker >/dev/null 2>&1 || die "未找到 docker。请先安装 Docker 再运行本脚本。"
-  docker info >/dev/null 2>&1 || die "docker 无法连接（守护进程没起？当前用户无权限？）"
+  # 新手在新 VPS 上撞的第一堵墙就是"没装 docker"。只说"请先安装 Docker"是没用的 ——
+  # 得把**能直接粘的命令**给出来。
+  if ! command -v docker >/dev/null 2>&1; then
+    problem "这台机器上还没装 docker（跑这个服务必须用它）"
+    info "装它很简单，把下面这行粘进去回车就行（官方一键脚本）："
+    printf '      %scurl -fsSL https://get.docker.com | sh%s\n' "$C_BLD" "$C_OFF"
+    info "${C_DIM}装完再重新跑本脚本即可。${C_OFF}"
+    die "缺少 docker，已中止（未做任何改动）。"
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    problem "docker 装了，但连不上它的后台服务"
+    info "多半是服务没在跑，试这条："
+    printf '      %ssystemctl start docker && systemctl enable docker%s\n' "$C_BLD" "$C_OFF"
+    info "${C_DIM}（如果是权限问题，请用 root 或加 sudo 重跑本脚本）${C_OFF}"
+    die "docker 不可用，已中止（未做任何改动）。"
+  fi
   if docker compose version >/dev/null 2>&1; then DC=(docker compose)
   elif command -v docker-compose >/dev/null 2>&1; then DC=(docker-compose)
-  else die "未找到 docker compose 插件，也没有 docker-compose。"; fi
-  ok "docker 就绪（${DC[*]}）"
+  else
+    problem "docker 装了，但缺 compose 插件（用来编排服务）"
+    info "用上面那条官方脚本装的 docker 一般自带；也可以单独装："
+    printf '      %sapt install -y docker-compose-plugin%s\n' "$C_BLD" "$C_OFF"
+    die "缺少 docker compose，已中止（未做任何改动）。"
+  fi
+  ok "docker 已就绪（跑服务要用的容器工具，不用你管）"
 }
 
 # 宿主上所有被占用的端口（监听 + docker 已发布）
@@ -387,9 +408,11 @@ check_ports_free() {
     if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$"; then busy="${busy} ${p}"; fi
   done
   if [ -n "$busy" ]; then
-    problem "端口${busy} 已被占用，无法由本脚本自建反代申请证书"
-    info "方案：① 停掉占用者；② 改用 --no-domain（走 SSH 隧道访问面板）；"
-    info "      ③ 自己把域名反代到 127.0.0.1:${PANEL_PORT} 与 127.0.0.1:${GW_PORT}。"
+    problem "端口${busy} 被别的程序占着 —— 本脚本要腾出 80/443 才能申请 HTTPS 证书"
+    info "三个办法，任选一个："
+    info "  ① 把占着 80/443 的程序停掉，再重跑本脚本"
+    info "  ② 不绑域名：重跑时加 --no-domain（之后走 SSH 隧道访问，不影响使用）"
+    info "  ③ 你自己用现有的网页服务器转发到 127.0.0.1:${PANEL_PORT}（面板）和 :${GW_PORT}（网关）"
     return 1
   fi
   return 0
@@ -567,32 +590,38 @@ gather_config() {
     info "目录：$INSTALL_DIR"
     info "容器：$CONTAINER    面板端口：$PANEL_PORT    网关端口：$GW_PORT"
     info "域名：${DOMAIN:-（无）}"
-    local c; c=$(choose "要做什么？" 1 "重新配置并重启容器" "只升级镜像到新 tag" "卸载" "退出")
+    local c; c=$(choose "要做什么？" 1 "重新配置并重启服务" "升级到新版本" "卸载" "退出")
     case "$c" in
       1) RECONFIG=1 ;;   # 明确要重新配置 → 后面【第 2 步】必须给开关（不能因为状态文件已填满就跳过）
-      2) local t; t=$(ask "新的镜像 tag" "latest"); IMAGE_TAG="$t"; return 0 ;;
+      2) local t; t=$(ask "要升级到哪个版本（直接回车 = 最新版）" "latest"); IMAGE_TAG="$t"; return 0 ;;
       3) DO_UNINSTALL=1; return 0 ;;
       4) exit 0 ;;
     esac
   fi
 
   title "agent2api 安装配置"
-  info "直接回车 = 用括号里的默认值"
+  # 说明只在**真的会提问**时才打印。以前 --yes / 管道场景下也会打印"直接回车 = 用默认值"
+  # 和整段提问说明，看着像要问你、其实一个问题都不问 —— 对新手是误导。
+  local will_ask=0
   if [ "$ASSUME_YES" = 1 ]; then
-    info "${C_DIM}（--yes 模式：全部使用默认值）${C_OFF}"
+    info "${C_DIM}（--yes 模式：全部使用默认值，不会问你任何问题）${C_OFF}"
   elif [ ! -t 0 ]; then
-    # 🔴 不能静默！stdin 不是终端时 ask() 会直接返回默认值 —— 用户会以为"脚本坏了、一个问题都不问"。
-    warn "当前不是交互终端（stdin 不是 tty）：所有问题将自动采用默认值。"
+    warn "当前不是交互终端（stdin 不是 tty）：所有问题将自动采用默认值，不会问你。"
     info "${C_DIM}想逐项选择，请在终端里直接执行：bash $0${C_OFF}"
+  else
+    will_ask=1
+    info "下面会问你 1-2 个问题 —— 直接回车 = 用括号里的默认值"
   fi
 
   # ── 第 1 步：域名。它决定你后面**怎么访问**，是最关键的决策，所以放最前 ──
   if [ -z "$DOMAIN" ] && [ "$NO_DOMAIN" != 1 ]; then
-    printf '\n' >&2
-    info "【第 1 步】要不要绑域名？"
-    printf '        %s绑  → 自动申请 HTTPS 证书，客户端用 https://你的域名/v1（推荐）%s\n' "$C_DIM" "$C_OFF"
-    printf '        %s不绑 → 只能走 SSH 隧道，客户端用 http://127.0.0.1:<网关端口>/v1%s\n' "$C_DIM" "$C_OFF"
-    printf '        %s（不绑的话，域名解析这一步和证书都不用管）%s\n' "$C_DIM" "$C_OFF"
+    if [ "$will_ask" = 1 ]; then
+      printf '\n' >&2
+      info "【第 1 步】要不要绑域名？"
+      printf '        %s绑  → 自动申请 HTTPS 证书，客户端用 https://你的域名/v1（推荐）%s\n' "$C_DIM" "$C_OFF"
+      printf '        %s不绑 → 只能走 SSH 隧道，客户端用 http://127.0.0.1:<网关端口>/v1%s\n' "$C_DIM" "$C_OFF"
+      printf '        %s（不确定就回车：装完会告诉你下一步怎么做）%s\n' "$C_DIM" "$C_OFF"
+    fi
     DOMAIN=$(ask "域名（没有就直接回车）" "")
   fi
   if [ -n "$DOMAIN" ]; then
@@ -607,10 +636,13 @@ gather_config() {
       info "${C_DIM}agent2api 的规则是「首个访问者注册管理员」。所以面板一上线，谁先打开谁就是管理员。${C_OFF}"
       info "${C_DIM}不封（默认）：注册最方便，但你得尽快去注册 —— 域名签证书后会进 CT 日志被公开索引。${C_OFF}"
       info "${C_DIM}封掉：注册端点返回 403，注册只能走 SSH 隧道（安全，但多一步）。${C_OFF}"
-      if ask_yn "从公网禁止自助注册？" "n"; then LOCK_REGISTER="y"; else LOCK_REGISTER="n"; fi
+      if ask_yn "要不要禁止别人从网上自己注册账号？" "n"; then LOCK_REGISTER="y"; else LOCK_REGISTER="n"; fi
     fi
     if [ -z "$BEHIND_CF" ]; then
-      if ask_yn "该域名是否走 Cloudflare 代理（橙云）？" "n"; then BEHIND_CF="y"; else BEHIND_CF="n"; fi
+      if [ "$will_ask" = 1 ]; then
+        info "${C_DIM}你的域名是不是在 Cloudflare 上、并且开了「橙色云朵」？是的话选 y；不确定就回车。${C_OFF}"
+      fi
+      if ask_yn "域名走了 Cloudflare 代理（橙云）吗？" "n"; then BEHIND_CF="y"; else BEHIND_CF="n"; fi
     fi
   else
     EXPOSE_MODE="none"; LOCK_REGISTER="${LOCK_REGISTER:-n}"; BEHIND_CF="n"
@@ -626,7 +658,7 @@ gather_config() {
   done
   if [ "$ASSUME_YES" = 0 ] && [ -t 0 ] && { [ "$missing" = 1 ] || [ "$RECONFIG" = 1 ]; }; then
     printf '\n' >&2
-    info "【第 2 步】高级选项：安装目录 / 容器名 / 端口 / 内存 / 时区 / 镜像版本"
+    info "【第 2 步】高级选项：安装目录 / 服务名字 / 端口 / 内存 / 时区 / 版本"
     info "${C_DIM}  这些默认值都挑好了，一般不用改${C_OFF}"
     ask_yn "需要改吗？" "n" || adv=0
   fi
@@ -646,26 +678,26 @@ gather_config() {
     [ "$PANEL_PORT" != "$GW_PORT" ] || die "面板端口与网关端口不能相同（都是 $PANEL_PORT）"
   else
     [ -n "$INSTALL_DIR" ] || INSTALL_DIR=$(ask "安装目录" "$DEFAULT_DIR")
-    [ -n "$CONTAINER" ]   || CONTAINER=$(ask "容器名" "$DEFAULT_CONTAINER")
-    [ -n "$TZ_NAME" ]     || TZ_NAME=$(ask "容器时区" "Asia/Shanghai")
+    [ -n "$CONTAINER" ]   || CONTAINER=$(ask "服务名字（就是个标识，随便起）" "$DEFAULT_CONTAINER")
+    [ -n "$TZ_NAME" ]     || TZ_NAME=$(ask "时区（影响日志时间，一般不用改）" "Asia/Shanghai")
 
     if [ -z "$IMAGE_TAG" ]; then
       local latest; latest=$(docker_hub_latest_tag || true)
       if [ -n "$latest" ]; then
-        IMAGE_TAG=$(ask "镜像版本（Docker Hub 最新为 $latest）" "$latest")
+        IMAGE_TAG=$(ask "版本（最新是 $latest）" "$latest")
       else
-        IMAGE_TAG=$(ask "镜像版本" "$DEFAULT_TAG")
+        IMAGE_TAG=$(ask "版本" "$DEFAULT_TAG")
       fi
     fi
 
     # 端口：自动避让
     if [ -z "$PANEL_PORT" ]; then
       local auto_panel; auto_panel=$(pick_port "$DEFAULT_PANEL_PORT" "" || echo "$DEFAULT_PANEL_PORT")
-      PANEL_PORT=$(ask_port "面板端口（$DEFAULT_PANEL_PORT 被占用时自动从它起找空闲）" "$auto_panel")
+      PANEL_PORT=$(ask_port "面板端口（已自动挑好空闲的，一般不用改）" "$auto_panel")
     fi
     if [ -z "$GW_PORT" ]; then
       local auto_gw; auto_gw=$(pick_port "$DEFAULT_GW_PORT" "$PANEL_PORT" || echo "$DEFAULT_GW_PORT")
-      GW_PORT=$(ask_port "网关端口" "$auto_gw")
+      GW_PORT=$(ask_port "网关端口（同上，不用改）" "$auto_gw")
     fi
     [ "$PANEL_PORT" != "$GW_PORT" ] || die "面板端口与网关端口不能相同（都是 $PANEL_PORT）"
 
@@ -673,14 +705,14 @@ gather_config() {
     if ! port_free "$PANEL_PORT"; then warn "端口 $PANEL_PORT 已被占用，启动失败时脚本会自动换端口重试"; fi
     if ! port_free "$GW_PORT";    then warn "端口 $GW_PORT 已被占用，启动失败时脚本会自动换端口重试"; fi
 
-    [ -n "$MEM_LIMIT" ] || MEM_LIMIT=$(ask_mem "容器内存上限" "$DEFAULT_MEM")
+    [ -n "$MEM_LIMIT" ] || MEM_LIMIT=$(ask_mem "内存上限（够用就行）" "$DEFAULT_MEM")
   fi
 
   # workbuddy-manager 集成（只在交互 + 高级选项开启时问）
   if [ -z "$MANAGER_INTEGRATE" ]; then
     if [ "$adv" = 1 ] && docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'workbuddy-manager'; then
       printf '\n' >&2
-      if ask_yn "检测到 workbuddy-manager，要把本服务登记为它的上游吗？" "n"; then
+      if ask_yn "这台机器上还有个 workbuddy-manager 面板，要不要把它接到那个面板上？" "n"; then
         MANAGER_INTEGRATE="y"; else MANAGER_INTEGRATE="n"; fi
     else
       MANAGER_INTEGRATE="n"
@@ -963,7 +995,8 @@ EOF
 compose() { ( cd "$INSTALL_DIR" && "${DC[@]}" "$@" ); }
 
 start_container() {
-  step "3/6" "拉取镜像并启动容器"
+  step "3/6" "下载并启动服务"
+  info "${C_DIM}第一次要下载程序本体，这一步最慢 —— 网慢的话几分钟，看着不动也别关。${C_OFF}"
   LAST_FAIL_KIND=""
   run compose pull --quiet || warn "拉取镜像出错，尝试继续"
   if [ "$DRY_RUN" = 1 ]; then
@@ -1144,12 +1177,13 @@ apply_domain() {
   step "5/6" "绑定域名 ${DOMAIN} 并申请证书"
 
   [ "$CADDY_MODE" = "docker" ] || [ "$CADDY_MODE" = "host" ] || [ "$CADDY_MODE" = "self" ] \
-    || die "当前反代形态（$CADDY_MODE）无法自动配置域名。用 --no-domain 走隧道，或自行反代到 127.0.0.1:${PANEL_PORT}（面板）/ :${GW_PORT}（网关）。"
+    || { info "${C_DIM}（这台机器上跑着 ${CADDY_MODE}，本脚本不会去改它，以免弄坏你现有的网站）${C_OFF}"
+         die "没法自动配域名。两个办法：重跑时加 --no-domain（走 SSH 隧道），或你自己把域名转发到 127.0.0.1:${PANEL_PORT}（面板）和 :${GW_PORT}（网关）。"; }
   if [ "$CADDY_MODE" = "self" ]; then
     install -d -m 755 "$INSTALL_DIR"
     [ -f "$CADDY_FILE" ] || printf '# managed by install-agent2api.sh\n' > "$CADDY_FILE"
   else
-    locate_caddyfile || die "找到了 Caddy，但没定位到 Caddyfile，请手动配置后再试。"
+    locate_caddyfile || die "找到了网页服务器（Caddy），但没找到它的配置文件（通常就在 /etc/caddy/Caddyfile）。也可以重跑时加 --no-domain，走隧道访问。"
   fi
 
   # DNS 提醒（CDN/代理场景解析到边缘 IP 是正常的，所以允许 --skip-dns-check 强制继续）
@@ -1478,7 +1512,7 @@ do_status() {
   load_state || die "读不到 $INSTALL_DIR/install.conf（用 --dir 指定安装目录）"
   title "运行状态"
   info "安装目录：$INSTALL_DIR"
-  info "镜像：${DEFAULT_IMAGE_REPO}:${IMAGE_TAG}"
+  info "程序：${DEFAULT_IMAGE_REPO}:${IMAGE_TAG}"
   info "容器：${CONTAINER}"
   info "端口：面板 ${PANEL_PORT} / 网关 ${GW_PORT}"
   info "反代形态：${CADDY_MODE}${CADDY_NET:+（网络 $CADDY_NET）}"
@@ -1588,26 +1622,83 @@ do_uninstall() {
 
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 summary() {
-  title "安装完成"
-  # 管理员注册状态：agent2api 是「首个访客注册管理员」。默认不封注册时，
-  # 面板一上线谁先打开谁就是管理员 —— 所以这里必须明确告诉用户"注册了没、要不要马上去"。
+  # 管理员注册状态（决定"下一步"该说注册还是说登录）
   local registered=0
   if docker exec "$CONTAINER" curl -s --max-time 6 "http://127.0.0.1:${PANEL_PORT}/api/panel/status" 2>/dev/null \
      | grep -q '"registered":true'; then
     registered=1
   fi
-  case "$CADDY_MODE" in
-    self)
-      info "反代：本脚本自建的 Caddy 容器 ${CADDY_SELF_CONTAINER}（证书落在 ${INSTALL_DIR}/caddy-data）"
-      info "后端：${CONTAINER}:${PANEL_PORT}（面板）/ ${CONTAINER}:${GW_PORT}（网关）" ;;
-    *)
-      if [ "$UPSTREAM_STYLE" = "container" ]; then
-        info "反代后端：${CONTAINER}:${PANEL_PORT}（与 Caddy 同网络 ${CADDY_NET}）"
-      else
-        info "反代后端：127.0.0.1:${PANEL_PORT}"
-      fi ;;
-  esac
+
+  local panel_url
+  if [ -n "$DOMAIN" ]; then panel_url="https://${DOMAIN}/"; else panel_url="http://127.0.0.1:${PANEL_PORT}/"; fi
+
+  title "装好了！"
+
+  # ══════════ 新手只需要看这一段：一个明确的下一个动作 ══════════
   printf '\n'
+  printf '%s════════════════════════════════════════════════════════%s\n' "$C_BLD" "$C_OFF"
+  if [ "$registered" = 1 ]; then
+    printf '%s  下一步：用浏览器打开面板，用你刚注册的账号登录%s\n' "$C_BLD" "$C_OFF"
+  else
+    printf '%s  下一步：用浏览器打开面板，注册一个管理员账号%s\n' "$C_BLD" "$C_OFF"
+  fi
+  printf '%s════════════════════════════════════════════════════════%s\n' "$C_BLD" "$C_OFF"
+  printf '\n'
+
+  if [ -n "$DOMAIN" ]; then
+    printf '  打开这个网址：%s%s%s\n' "$C_BLD" "$panel_url" "$C_OFF"
+    [ "$registered" = 1 ] || printf '  然后按页面提示设个用户名和密码（随便设，记住就行）。\n'
+    if [ "$registered" != 1 ] && [ "$LOCK_REGISTER" != "y" ]; then
+      printf '\n'
+      problem "这一步请尽快做：现在任何人打开这个网址，都能抢先注册成管理员"
+      info "${C_DIM}（不想这样：重跑时加 --lock-register，注册就只走 SSH 隧道）${C_OFF}"
+    fi
+  else
+    # 不绑域名 → 面板只能从用户自己的电脑访问。新手最容易卡在这一步：
+    # 要开隧道、还会被问密码。所以分两步写清楚，连"会问密码""看着像卡住是正常的""窗口不能关"都说明白。
+    # 另外必须提一句"如果你平时不是用密码登录的"——脚本打印的是 root@IP，
+    # 会绕过用户自己的 ssh 别名/密钥（实测：用别名能通、直接敲 IP 会被拒）。
+    local ssh_host ssh_user
+    ssh_host=$(host_public_ip || true); [ -n "$ssh_host" ] || ssh_host="<你的服务器IP>"
+    ssh_user="${SUDO_USER:-}"; [ -n "$ssh_user" ] || ssh_user="$(id -un 2>/dev/null || echo root)"
+
+    printf '  你没绑域名，所以面板只能从你自己的电脑访问。两步：\n\n'
+    printf '  %s第 1 步：在你自己的电脑上开个终端（Windows 按 Win+R 输入 cmd 回车），粘这条：%s\n' "$C_BLD" "$C_OFF"
+    printf '\n'
+    printf '      %sssh -N -L %s:127.0.0.1:%s -L %s:127.0.0.1:%s %s@%s%s\n' \
+      "$C_DIM" "$PANEL_PORT" "$PANEL_PORT" "$GW_PORT" "$GW_PORT" "$ssh_user" "$ssh_host" "$C_OFF"
+    printf '\n'
+    printf '      %s它会让你输密码 —— 就是你登录这台服务器时用的那个。%s\n' "$C_DIM" "$C_OFF"
+    printf '      %s输完屏幕上不会出现任何东西、看着像卡住，那是正常的（它在保持连接）。%s\n' "$C_DIM" "$C_OFF"
+    printf '      %s这个窗口别关，关了连接就断。%s\n' "$C_DIM" "$C_OFF"
+    printf '\n'
+    printf '      %s如果它报 Permission denied（密码不对），说明你平时不是用密码登录这台机器的 ——%s\n' "$C_DIM" "$C_OFF"
+    printf '      %s那就把你自己平时登录它的那条 ssh 命令拿出来，在后面加上这两个参数：%s\n' "$C_DIM" "$C_OFF"
+    printf '          %s-N -L %s:127.0.0.1:%s -L %s:127.0.0.1:%s%s\n' \
+      "$C_BLD" "$PANEL_PORT" "$PANEL_PORT" "$GW_PORT" "$GW_PORT" "$C_OFF"
+    printf '      %s（比如平时敲 ssh myvps 就能进，那就敲：ssh -N -L %s:127.0.0.1:%s -L %s:127.0.0.1:%s myvps）%s\n' \
+      "$C_DIM" "$PANEL_PORT" "$PANEL_PORT" "$GW_PORT" "$GW_PORT" "$C_OFF"
+    printf '\n'
+    printf '  %s第 2 步：另开浏览器，打开 %s%s%s%s\n' "$C_BLD" "$C_OFF" "$C_BLD" "$panel_url" "$C_OFF"
+    printf '          然后按页面提示设个用户名和密码。\n'
+  fi
+
+  # ── 进面板之后要做的三件事（小白最容易卡在「建了 Key 但没有模型」）──
+  printf '\n'
+  info "进面板之后，按这个顺序做三件事："
+  printf '      %s①%s 在「账号」里加上你的 AI 上游账号（少了这步，客户端会拿不到任何模型）\n' "$C_BLD" "$C_OFF"
+  printf '      %s②%s 在「网关 Key」里建一把 Key（客户端要用它）\n' "$C_BLD" "$C_OFF"
+  printf '      %s③%s 把它填到你的 AI 工具里（见下面「客户端里怎么填」）\n' "$C_BLD" "$C_OFF"
+
+  # ══════════ 以下降级为参考资料 ══════════
+  printf '\n'
+  printf '%s  ────────── 以下是详细信息，以后需要再查 ──────────%s\n' "$C_DIM" "$C_OFF"
+  printf '\n'
+
+  case "$CADDY_MODE" in
+    self)        info "网页服务器：本脚本自建的容器（证书存在 ${INSTALL_DIR}/caddy-data）" ;;
+    docker|host) info "网页服务器：复用这台机器上已有的 Caddy（配置已自动备份，不影响现有网站）" ;;
+  esac
   if [ -n "$DOMAIN" ]; then
     case "$EXPOSE_MODE" in
       panel)   printf '  %s面板：%s https://%s/\n' "$C_BLD" "$C_OFF" "$DOMAIN" ;;
@@ -1616,63 +1707,31 @@ summary() {
                printf '  %s网关：%s https://%s/v1\n' "$C_BLD" "$C_OFF" "$DOMAIN" ;;
     esac
   else
-    # 不绑域名时，必须把「怎么用」讲清楚。只给面板端口是不够的 ——
-    # 用户真正要连的是**网关**（客户端 base_url 填的就是它），隧道里漏了它等于装完没法用。
-    local ssh_host ssh_user
-    ssh_host=$(host_public_ip || true)
-    [ -n "$ssh_host" ] || ssh_host="<你的服务器IP>"
-    ssh_user="${SUDO_USER:-}"
-    [ -n "$ssh_user" ] || ssh_user="$(id -un 2>/dev/null || echo root)"
-
-    info "未绑域名 —— 用 SSH 隧道访问。下面这条在${C_BLD}你自己的电脑${C_OFF}上执行："
-    printf '\n'
-    printf '      %sssh -N -L %s:127.0.0.1:%s -L %s:127.0.0.1:%s %s@%s%s\n' \
-      "$C_DIM" "$PANEL_PORT" "$PANEL_PORT" "$GW_PORT" "$GW_PORT" "$ssh_user" "$ssh_host" "$C_OFF"
-    printf '\n'
-    info "${C_DIM}这条命令要一直开着（另开一个终端窗口跑）。它不输出任何东西、看着像卡住 —— 那是在转发，正常。${C_OFF}"
-    printf '\n'
-    printf '      面板 → 浏览器打开 %shttp://127.0.0.1:%s%s\n' "$C_BLD" "$PANEL_PORT" "$C_OFF"
-    printf '      网关 → 客户端 base_url 填 %shttp://127.0.0.1:%s/v1%s\n' "$C_BLD" "$GW_PORT" "$C_OFF"
-    printf '\n'
-    info "隧道只对你这台电脑有效，别人访问不到（这也是它比直接暴露公网安全的地方）。"
-    info "想省掉隧道：带上域名重跑（--domain 你的域名），会自动签 HTTPS 证书。"
+    printf '  %s面板：%s http://127.0.0.1:%s（走上面的隧道）\n' "$C_BLD" "$C_OFF" "$PANEL_PORT"
+    printf '  %s网关：%s http://127.0.0.1:%s/v1\n' "$C_BLD" "$C_OFF" "$GW_PORT"
   fi
   printf '\n'
-  # ── 管理员注册提醒：这是最要紧的一步，单独醒目提示 ──
-  if [ "$registered" = 1 ]; then
-    ok "管理员已注册"
-  elif [ -n "$DOMAIN" ] && [ "$LOCK_REGISTER" != "y" ]; then
-    problem "管理员还没注册 —— 现在任何人打开面板都能抢注成管理员，请立刻去注册！"
-    printf '      立刻打开：%shttps://%s/%s\n' "$C_BLD" "$DOMAIN" "$C_OFF"
-    info "${C_DIM}（不想开放注册：重跑并加 --lock-register，注册就只走 SSH 隧道）${C_OFF}"
-  elif [ -n "$DOMAIN" ]; then
-    warn "管理员还没注册。注册端点已封（403）—— 请走 SSH 隧道打开面板完成注册。"
-  else
-    warn "管理员还没注册 —— 打开 http://127.0.0.1:${PANEL_PORT}/ 完成注册（只能走隧道，别人碰不到）。"
-  fi
-  printf '\n'
-  info "首次使用：打开面板 → 注册管理员 → 「账号」添加上游账号 → 「网关 Key」建一把 Key"
+  info "客户端里怎么填（base_url 填地址，api_key 填面板里建的那把 Key）："
   if [ -n "$DOMAIN" ]; then
-    info "客户端接入：base_url = https://${DOMAIN}/v1，api_key = 面板里那把 Key"
+    printf '      base_url = %shttps://%s/v1%s\n' "$C_BLD" "$DOMAIN" "$C_OFF"
   else
-    info "客户端接入：base_url = http://127.0.0.1:${GW_PORT}/v1（走上面的隧道），api_key = 面板里那把 Key"
+    printf '      base_url = %shttp://127.0.0.1:%s/v1%s\n' "$C_BLD" "$GW_PORT" "$C_OFF"
   fi
-  if [ "$LOCK_REGISTER" = "y" ] && [ -n "$DOMAIN" ]; then
-    info "${C_DIM}注册端点已封（$SETUP_PATH → 403）。要开放就重跑并加 --open-register。${C_OFF}"
-  fi
+  printf '      api_key  = 面板 →「网关 Key」→ 新建，建出来是一串 sk-a2a- 开头的字符\n'
   printf '\n'
   info "常用命令："
-  printf '      cd %s && docker compose logs -f --tail 50\n' "$INSTALL_DIR"
-  printf '      cd %s && docker compose restart\n' "$INSTALL_DIR"
-  printf '      bash %s --status\n' "$0"
-  printf '      bash %s --upgrade\n' "$0"
-  printf '      bash %s --uninstall\n' "$0"
+  printf '      bash %s --status        # 看运行状态\n' "$0"
+  printf '      bash %s --upgrade       # 升级\n' "$0"
+  printf '      bash %s --uninstall     # 卸载\n' "$0"
+  printf '      cd %s && docker compose logs -f --tail 50   # 看日志\n' "$INSTALL_DIR"
   printf '\n'
-  info "状态文件：$(state_file)（改完重跑脚本即可生效）"
+  info "${C_DIM}状态文件：$(state_file)（改完重跑脚本即可生效）${C_OFF}"
+  if [ "$LOCK_REGISTER" = "y" ] && [ -n "$DOMAIN" ]; then
+    info "${C_DIM}注册端点已封。要开放就重跑并加 --open-register。${C_OFF}"
+  fi
   printf '\n'
-  # 换新机器时不用再手动下载上传 —— 直接把这行粘到新 VPS 上
-  info "要在别的机器上装，把下面这行粘过去就行（不用先下载再上传）："
-  printf '      curl -fsSL https://cdn.jsdelivr.net/gh/yys9253462-gif/agent2api-installer@main/deploy.sh | sudo bash\n'
+  info "${C_DIM}要在别的机器上装，把这行粘过去就行：${C_OFF}"
+  printf '      %scurl -fsSL https://cdn.jsdelivr.net/gh/yys9253462-gif/agent2api-installer@main/deploy.sh | sudo bash%s\n' "$C_DIM" "$C_OFF"
 }
 
 # ── 主流程 ──────────────────────────────────────────────────────────────────
@@ -1681,20 +1740,36 @@ main() {
   title "agent2api 一键安装器 v$SCRIPT_VERSION"
   [ "$DRY_RUN" = 1 ] && warn "dry-run 模式：只打印计划，不会做任何改动"
 
+  # 新手友好：先用人话说清楚「在装什么、要多久、会被问几个问题」。
+  # 小白刚粘完一条陌生命令，第一屏必须让他知道"这事在往哪走"，而不是直接看到一堆术语。
+  # 只在安装路径显示（查状态/卸载/升级时不需要这段开场白）。
+  if [ -z "${DO_STATUS}${DO_UNINSTALL}${DO_UPGRADE}${DO_CHECK_UPDATE}" ]; then
+    printf '\n'
+    info "我在帮你装一个 agent2api 服务。装好之后你可以："
+    info "  · 用浏览器打开一个网址来管理它（加账号、建密钥）"
+    info "  · 让 AI 工具（客户端）连上它来调用接口"
+    printf '\n'
+    info "${C_DIM}大概要 1-3 分钟 —— 第一次得下载程序本体，网慢就久一点，别急。${C_OFF}"
+    info "${C_DIM}只会问你 1-2 个问题。拿不准的${C_OFF}${C_BLD}直接按回车${C_OFF}${C_DIM}，用默认值就行。${C_OFF}"
+  fi
+
   need_root
   check_docker
 
-  step "1/6" "探测环境"
+  step "1/6" "检查环境"
   detect_web_server
   resolve_caddy_net
   case "$CADDY_MODE" in
     docker) ok "发现 Caddy 容器：$CADDY_CONTAINER" ;;
-    host)   ok "发现宿主 Caddy（systemd/进程）" ;;
+    host)   ok "这台机器上已有网页服务器（Caddy），会复用它配 HTTPS" ;;
     nginx)  warn "80/443 上是 Nginx（本脚本只自动写 Caddy 配置）—— 绑域名需你手动反代" ;;
     other)  warn "80/443 被非 Caddy 程序占用 —— 绑域名需你手动反代" ;;
     none)   info "80/443 上没有反向代理；若绑域名，将由本脚本自建 Caddy 容器（需 80/443 空闲）" ;;
   esac
-  if locate_caddyfile; then ok "Caddyfile：$CADDY_FILE"; elif [ "$CADDY_MODE" != "none" ]; then warn "未定位到 Caddyfile"; fi
+  if locate_caddyfile; then
+    ok "已找到它的配置文件（改之前会自动备份，不影响你现有的网站）"
+    info "${C_DIM}  （文件位置：$CADDY_FILE）${C_OFF}"
+  elif [ "$CADDY_MODE" != "none" ]; then warn "没找到网页服务器的配置文件，稍后会按另一种方式处理"; fi
 
   # 安装目录先定下来（状态文件在它下面），再读回上次的配置作为默认值
   [ -n "$INSTALL_DIR" ] || INSTALL_DIR="$DEFAULT_DIR"
@@ -1720,10 +1795,17 @@ main() {
   decide_caddy_mode
 
   info "安装目录：$INSTALL_DIR"
-  info "镜像：${DEFAULT_IMAGE_REPO}:${IMAGE_TAG}"
+  info "程序：${DEFAULT_IMAGE_REPO}:${IMAGE_TAG}"
   info "面板端口：$PANEL_PORT    网关端口：$GW_PORT"
-  info "域名：${DOMAIN:-（不绑）}    暴露：${EXPOSE_MODE}"
-  info "注册封锁：${LOCK_REGISTER}    内存上限：$MEM_LIMIT"
+  local expose_cn
+  case "$EXPOSE_MODE" in
+    both)    expose_cn="面板 + 网关" ;;
+    panel)   expose_cn="只有面板" ;;
+    gateway) expose_cn="只有网关（/v1）" ;;
+    *)       expose_cn="无（没绑域名）" ;;
+  esac
+  info "域名：${DOMAIN:-（不绑）}    对外提供：$expose_cn"
+  info "禁止自助注册：${LOCK_REGISTER}    内存上限：$MEM_LIMIT"
 
   if [ "$ASSUME_YES" = 0 ] && [ -t 0 ]; then
     printf '\n'
