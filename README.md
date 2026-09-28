@@ -26,7 +26,7 @@ curl -fsSLO https://raw.githubusercontent.com/yys9253462-gif/agent2api-installer
 
 国内访问 GitHub 不稳，也可以走网盘（永久取件码 **20818**）：<https://pan.ailxw.com/pickup/20818>
 
-图文教程（含逐项参数、实测记录与踩坑）：<https://isoziyuan.com/p/agent2api-one-click-installer/>
+图文教程（含逐项参数、实测记录与踩坑）：<https://isoziyuan.com/p/100171/>
 
 ---
 
