@@ -5,7 +5,7 @@
 
 - **单文件**：`install-agent2api.sh`，除 docker 外无依赖
 - **版本**：v1.1.0
-- **配套回归套件**：`test-install-agent2api.sh`（28 个用例，一条命令跑完）
+- **配套回归套件**：`test-install-agent2api.sh`（29 个用例，一条命令跑完）
 - **测试状态**：已在 Debian 12 + Docker 29.8.1 上端到端实测通过（含真实域名签证书、SSE 流式、升级回滚、卸载）
 
 > ⚠️ **免责声明**：本仓库是**非官方**的第三方部署脚本，与 agent2api 上游项目及作者无任何关联，
@@ -38,7 +38,7 @@ curl -fsSLO https://raw.githubusercontent.com/yys9253462-gif/agent2api-installer
 | **端口** | 自动避开宿主监听 + docker 已发布端口；**绑定失败自动换端口重试**（最多 3 次） |
 | **反代** | 自动识别 **4 种形态**：宿主 Caddy / 容器 Caddy / **裸机自建 Caddy** / 不绑；`--caddy-mode` 可强制 |
 | **域名与证书** | DNS 校验 → 备份 → 追加站点块 → validate → **热重载** → 等证书签发 → 验 HTTPS 与 `/v1`；**任一步失败自动回滚** |
-| **安全默认** | 公网自助注册默认 403（域名进 CT 日志会被公开索引）；`--open-register` 可关 |
+| **注册开关** | **默认不封**（浏览器直接注册）；`--lock-register` 可封成 403；装完会检测「管理员注册了没」并提醒 |
 | **幂等** | 标记块式管理，重跑不叠加；**状态文件当默认值**（命令行显式项优先）；`--no-domain` 显式移除 |
 | **运维** | `--status`（健康/证书到期/日志）、`--check-update`、**`--upgrade`（健康门禁 + 失败自动回滚）** |
 | **卸载** | 停容器 + 按标记摘除站点块 + 可选删目录；从未安装时也不报错 |
@@ -46,7 +46,7 @@ curl -fsSLO https://raw.githubusercontent.com/yys9253462-gif/agent2api-installer
 | **集成** | `--with-manager` 登记为 workbuddy-manager 上游，网关 Key **自动从本机库读取**（免粘贴） |
 | **Nginx 用户** | 不自动改 Nginx，但打印**可直接粘贴**的 server 块 + certbot 命令（含 `proxy_buffering off`） |
 
-**自动化回归套件**：`test-install-agent2api.sh`，**28 个用例**，一条命令跑完。
+**自动化回归套件**：`test-install-agent2api.sh`，**29 个用例**，一条命令跑完。
 
 ---
 
@@ -234,7 +234,7 @@ sudo bash install-agent2api.sh --uninstall
 | `--status` | 查看运行状态（容器/端口/域名/证书到期/最近日志） |
 | `--check-update` | 查询 Docker Hub 上是否有新版本 |
 | `--upgrade` | 升级到最新版（可配 `--tag` 指定版本）；健康复检不过**自动回滚** |
-| `--lock-register` / `--open-register` | 是否封掉公网自助注册（**默认封**） |
+| `--lock-register` / `--open-register` | 是否封掉公网自助注册（**默认不封**） |
 | `--with-manager` / `--no-manager` | 是否登记为已有 workbuddy-manager 的上游 |
 | `--skip-dns-check` | 跳过「域名是否解析到本机」校验（走 CDN 回源时用） |
 | `--dry-run` / `-y` / `--uninstall` | 预演 / 全默认不交互 / 卸载 |
@@ -315,15 +315,23 @@ sudo bash install-agent2api.sh --upgrade --tag 2.8.0 --dir /opt/... # 升/降到
 
 ---
 
-## 安全默认（重要）
+## 注册与安全（重要）
 
-**公网自助注册默认被封。** agent2api 的默认行为是「第一个访问面板的人注册成管理员」——
-而域名签了证书后，主机名会进 **Certificate Transparency 日志被公开索引**，
-不封等于把这台持有明文凭证的管理台交给陌生人。所以脚本默认：
+agent2api 的规则是「**第一个打开面板的人注册成管理员**」。域名签了证书后，主机名会进
+**Certificate Transparency 日志被公开索引** —— 所以在「面板刚上线、管理员还没注册」的那段时间里，
+谁先打开谁就是管理员。
 
-- `POST /api/panel/setup`（自助注册）从公网 **403**；
-- 注册改走 **SSH 隧道**（隧道直连容器，不经过 Caddy，不受该规则影响）。
-  注意**两个端口都要转发** —— 只转面板的话，面板能开、但客户端连不上网关：
+**脚本默认不封注册**（`/api/panel/setup` 正常可用）—— 大多数人就是想在浏览器里直接注册完事。
+但脚本装完会**检测管理员注册了没**，没注册就醒目提醒：
+
+```
+× 管理员还没注册 —— 现在任何人打开面板都能抢注成管理员，请立刻去注册！
+    立刻打开：https://你的域名/
+```
+
+**想更稳妥就封掉**：重跑时加 `--lock-register`，注册端点返回 403，注册改走 **SSH 隧道**
+（隧道直连容器、不经过 Caddy，不受该规则影响）。注意**两个端口都要转发** ——
+只转面板的话，面板能开、但客户端连不上网关：
 
 ```bash
 ssh -N -L 3066:127.0.0.1:3066 -L 3065:127.0.0.1:3065 root@<服务器IP>
@@ -332,8 +340,12 @@ ssh -N -L 3066:127.0.0.1:3066 -L 3065:127.0.0.1:3065 root@<服务器IP>
 ```
 
 然后：面板开 `http://127.0.0.1:3066`，客户端 `base_url` 填 `http://127.0.0.1:3065/v1`。
-# 然后浏览器打开 http://127.0.0.1:3066 注册
-```
+想再开回来：重跑加 `--open-register`。
+
+| 你的情况 | 建议 |
+| --- | --- |
+| 想直接在浏览器里注册（大多数人） | 默认就行（不封），**装完马上去注册** |
+| 域名会被扫到、且你不急着注册 | 加 `--lock-register`，注册走隧道 |
 
 注册完就能用域名正常登录。确实想开公网注册就加 `--open-register`（不推荐）。
 
@@ -387,7 +399,7 @@ ssh -N -L 3066:127.0.0.1:3066 -L 3065:127.0.0.1:3065 root@<服务器IP>
 | **回归套件（带域名）** | **23 通过 / 0 失败 / 0 跳过** |
 | 套件自身清理 | 无残留容器/目录/配置块；生产站 rdwb.example.net 全程 200 |
 
-**回归套件** `test-install-agent2api.sh` 把这 23 个用例固化成一条命令，改完脚本直接跑。
+**回归套件** `test-install-agent2api.sh` 把这 29 个用例固化成一条命令，改完脚本直接跑。
 
 ---
 
@@ -465,7 +477,7 @@ ssh -N -L 3066:127.0.0.1:3066 -L 3065:127.0.0.1:3065 root@<服务器IP>
 改完脚本**别再手工点**，跑这个：
 
 ```bash
-bash test-install-agent2api.sh                                    # 21 个用例
+bash test-install-agent2api.sh                                    # 29 个用例（带域名与流式时全跑）
 TEST_DOMAIN=a2a.example.com bash test-install-agent2api.sh        # 加 5 个域名/TLS 用例
 EXISTING_DOMAINS="你的站1 你的站2" bash test-install-agent2api.sh # 附带回检生产站未被影响
 # 流式用例要指向「已有真实账号」的端点（可与被测机器不是同一台）：
@@ -476,7 +488,7 @@ KEEP=1 bash test-install-agent2api.sh                             # 失败时保
 
 - 退出码 = 失败用例数；`INSTALLER=` 可指定被测脚本路径。
 - 覆盖：参数校验 10 项、默认值路径与幂等 3 项、**状态与版本管理 4 项**、端口与容器名冲突 2 项、
-  域名与 TLS 5 项（需 `TEST_DOMAIN`）、**流式 SSE 1 项**（需 `TEST_STREAM_URL`+密钥+模型）、
+  域名与 TLS 6 项（含**注册开关**，需 `TEST_DOMAIN`）、**流式 SSE 1 项**（需 `TEST_STREAM_URL`+密钥+模型）、
   卸载 2 项、生产站回检 1 项。
 - **它会真的起容器、真的改反代配置**，跑完自动清理；域名用例要求 `TEST_DOMAIN` 已解析到本机。
 - 最近一次完整结果：**28 通过 / 0 失败 / 0 跳过**（2026-09-28，Debian 12 测试机）。

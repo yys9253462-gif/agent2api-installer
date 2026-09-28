@@ -24,7 +24,7 @@
 #
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 DEFAULT_IMAGE_REPO="aimodcc/agent2api"
 DEFAULT_TAG="2.7.10"          # 已知可用版本；--tag latest 可跟最新
 DEFAULT_DIR="/opt/agent2api"
@@ -33,7 +33,7 @@ CADDY_IMAGE="caddy:2-alpine"   # self 模式下自建反代用的镜像
 DEFAULT_PANEL_PORT="3066"
 DEFAULT_GW_PORT="3065"
 DEFAULT_MEM="384m"
-SETUP_PATH="/api/panel/setup"  # agent2api 的自助注册端点（公网要封掉）
+SETUP_PATH="/api/panel/setup"  # agent2api 的自助注册端点（可选封锁，默认不封）
 MARK_BEGIN="# >>> agent2api managed block —— 由 install-agent2api.sh 维护，请勿手改 >>>"
 MARK_END="# <<< agent2api managed block <<<"
 CF_RANGES="173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22"
@@ -204,8 +204,8 @@ agent2api 一键安装器 v$SCRIPT_VERSION
   --mem <大小>            容器内存上限（默认 $DEFAULT_MEM）
   --tz <时区>             容器时区（默认 Asia/Shanghai）
   --cf [y|n]              域名是否走 Cloudflare 代理（橙云）。--cf=n 或 --no-cf 表示不走
-  --lock-register         公网禁止自助注册（默认开）
-  --open-register         不封注册端点（不推荐：首个访客即可注册成管理员）
+  --lock-register         公网禁止自助注册（默认不封，注册端点正常可用）
+  --open-register         不封注册端点（默认行为）。注意 agent2api 是「首个访客注册管理员」
   --with-manager          把本服务登记为已有 workbuddy-manager 的上游
   --no-manager            不登记（默认交互询问）
   --dry-run               只打印将要做什么，不实际改动
@@ -527,15 +527,16 @@ gather_config() {
     fi
     if [ -z "$LOCK_REGISTER" ]; then
       printf '\n' >&2
-      info "${C_DIM}agent2api 默认「首个访问者注册管理员」。域名签证书后主机名会进 CT 日志被公开索引，${C_OFF}"
-      info "${C_DIM}不封注册等于把这台管理台交给陌生人。注册可改走 SSH 隧道。${C_OFF}"
-      if ask_yn "从公网禁止自助注册？（强烈建议 y）" "y"; then LOCK_REGISTER="y"; else LOCK_REGISTER="n"; fi
+      info "${C_DIM}agent2api 的规则是「首个访问者注册管理员」。所以面板一上线，谁先打开谁就是管理员。${C_OFF}"
+      info "${C_DIM}不封（默认）：注册最方便，但你得尽快去注册 —— 域名签证书后会进 CT 日志被公开索引。${C_OFF}"
+      info "${C_DIM}封掉：注册端点返回 403，注册只能走 SSH 隧道（安全，但多一步）。${C_OFF}"
+      if ask_yn "从公网禁止自助注册？" "n"; then LOCK_REGISTER="y"; else LOCK_REGISTER="n"; fi
     fi
     if [ -z "$BEHIND_CF" ]; then
       if ask_yn "该域名是否走 Cloudflare 代理（橙云）？" "n"; then BEHIND_CF="y"; else BEHIND_CF="n"; fi
     fi
   else
-    EXPOSE_MODE="none"; LOCK_REGISTER="${LOCK_REGISTER:-y}"; BEHIND_CF="n"
+    EXPOSE_MODE="none"; LOCK_REGISTER="${LOCK_REGISTER:-n}"; BEHIND_CF="n"
   fi
 
   # ── 第 2 步：高级选项。默认**一个都不问** —— 小白不该被问容器名/时区/内存 ──
@@ -1475,6 +1476,13 @@ do_uninstall() {
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 summary() {
   title "安装完成"
+  # 管理员注册状态：agent2api 是「首个访客注册管理员」。默认不封注册时，
+  # 面板一上线谁先打开谁就是管理员 —— 所以这里必须明确告诉用户"注册了没、要不要马上去"。
+  local registered=0
+  if docker exec "$CONTAINER" curl -s --max-time 6 "http://127.0.0.1:${PANEL_PORT}/api/panel/status" 2>/dev/null \
+     | grep -q '"registered":true'; then
+    registered=1
+  fi
   case "$CADDY_MODE" in
     self)
       info "反代：本脚本自建的 Caddy 容器 ${CADDY_SELF_CONTAINER}（证书落在 ${INSTALL_DIR}/caddy-data）"
@@ -1517,13 +1525,28 @@ summary() {
     info "想省掉隧道：带上域名重跑（--domain 你的域名），会自动签 HTTPS 证书。"
   fi
   printf '\n'
+  # ── 管理员注册提醒：这是最要紧的一步，单独醒目提示 ──
+  if [ "$registered" = 1 ]; then
+    ok "管理员已注册"
+  elif [ -n "$DOMAIN" ] && [ "$LOCK_REGISTER" != "y" ]; then
+    problem "管理员还没注册 —— 现在任何人打开面板都能抢注成管理员，请立刻去注册！"
+    printf '      立刻打开：%shttps://%s/%s\n' "$C_BLD" "$DOMAIN" "$C_OFF"
+    info "${C_DIM}（不想开放注册：重跑并加 --lock-register，注册就只走 SSH 隧道）${C_OFF}"
+  elif [ -n "$DOMAIN" ]; then
+    warn "管理员还没注册。注册端点已封（403）—— 请走 SSH 隧道打开面板完成注册。"
+  else
+    warn "管理员还没注册 —— 打开 http://127.0.0.1:${PANEL_PORT}/ 完成注册（只能走隧道，别人碰不到）。"
+  fi
+  printf '\n'
   info "首次使用：打开面板 → 注册管理员 → 「账号」添加上游账号 → 「网关 Key」建一把 Key"
   if [ -n "$DOMAIN" ]; then
     info "客户端接入：base_url = https://${DOMAIN}/v1，api_key = 面板里那把 Key"
   else
     info "客户端接入：base_url = http://127.0.0.1:${GW_PORT}/v1（走上面的隧道），api_key = 面板里那把 Key"
   fi
-  [ "$LOCK_REGISTER" = "y" ] && info "${C_YEL}注意：公网自助注册已封（$SETUP_PATH → 403）。${C_OFF}"
+  if [ "$LOCK_REGISTER" = "y" ] && [ -n "$DOMAIN" ]; then
+    info "${C_DIM}注册端点已封（$SETUP_PATH → 403）。要开放就重跑并加 --open-register。${C_OFF}"
+  fi
   printf '\n'
   info "常用命令："
   printf '      cd %s && docker compose logs -f --tail 50\n' "$INSTALL_DIR"

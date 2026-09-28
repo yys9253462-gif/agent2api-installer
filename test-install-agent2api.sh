@@ -48,6 +48,10 @@ ctr()            { docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$1
 healthy()        { [ "$(docker inspect -f '{{.State.Health.Status}}' "$1" 2>/dev/null)" = "healthy" ]; }
 port_up()        { ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1$"; }
 http_code()      { curl -s -o /dev/null -w '%{http_code}' --max-time "${2:-10}" "$1" 2>/dev/null || echo 000; }
+# 自助注册端点返回码：默认应为「非 403」（403 = 被反代封掉）
+setup_code()     { curl -s -o /dev/null -w '%{http_code}' --max-time 15 -X POST \
+                     -H 'Content-Type: application/json' -d '{}' \
+                     "https://${TEST_DOMAIN}/api/panel/setup" 2>/dev/null || echo 000; }
 
 # 每个用例用独立目录，跑完（或失败后）都清理，避免互相干扰
 inst()  { printf '%s' "${TEST_ROOT}/$1"; }
@@ -265,7 +269,7 @@ domain_ready() {
   [ -n "$pip" ] && [ "$res" = "$pip" ]
 }
 case_domain_install() {
-  begin "域名安装：TLS 就绪 + /v1 可达 + 公网注册被封"
+  begin "域名安装：TLS 就绪 + /v1 可达 + 注册端点开放（默认不封）"
   DD="$(inst $DC)"; rm -rf "$DD"
   run_installer --yes --dir "$DD" --container "$DC" --domain "$TEST_DOMAIN" --expose both --cf=n \
                 --panel-port "$((P_PORT+20))" --gateway-port "$((G_PORT+20))"
@@ -275,10 +279,23 @@ case_domain_install() {
   local panel gw setup
   panel=$(http_code "https://${TEST_DOMAIN}/" 15)
   gw=$(http_code "https://${TEST_DOMAIN}/v1/models" 15)
-  setup=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -X POST \
-          -H 'Content-Type: application/json' -d '{}' "https://${TEST_DOMAIN}/api/panel/setup" 2>/dev/null)
-  { [ "$panel" = 200 ] && [ "$gw" = 200 ] && [ "$setup" = 403 ]; }
-  verdict $? "面板=$panel 网关=$gw setup=$setup"
+  setup=$(setup_code)
+  # 默认**不封**注册：端点必须可达（agent2api 自己可能因缺参数/人机验证返回 4xx，但绝不能是 403）
+  { [ "$panel" = 200 ] && [ "$gw" = 200 ] && [ "$setup" != 403 ]; }
+  verdict $? "面板=$panel 网关=$gw setup=$setup（403 才算被封）"
+}
+case_lock_register() {
+  begin "--lock-register 能封掉注册端点，--open-register 能恢复"
+  [ "$DOMAIN_INSTALLED" = 1 ] || { skip "域名用例未成功"; return; }
+  local on off
+  run_installer --yes --dir "$DD" --lock-register
+  [ "$RC" = 0 ] || { verdict 1 "加 --lock-register 重跑失败 rc=$RC"; return; }
+  sleep 2; on=$(setup_code)
+  run_installer --yes --dir "$DD" --open-register
+  [ "$RC" = 0 ] || { verdict 1 "加 --open-register 重跑失败 rc=$RC"; return; }
+  sleep 2; off=$(setup_code)
+  { [ "$on" = 403 ] && [ "$off" != 403 ]; }
+  verdict $? "封时=$on 开时=$off"
 }
 case_domain_marker_once() {
   begin "域名模式下托管块恰好一对标记（幂等）"
@@ -374,10 +391,10 @@ case_port_conflict_auto; case_container_name_conflict
 printf '\n%s[D] 域名与 TLS%s\n' "$FG_B" "$FG_O"
 if domain_ready; then
   note "TEST_DOMAIN=$TEST_DOMAIN 已解析到本机，执行域名用例"
-  case_domain_install; case_domain_marker_once; case_domain_prefill
+  case_domain_install; case_lock_register; case_domain_marker_once; case_domain_prefill
   case_domain_conflict_fastfail; case_no_domain_removes_block
 else
-  for n in "域名安装" "托管块幂等" "状态复用" "域名冲突 fail-fast" "--no-domain 摘除"; do
+  for n in "域名安装" "注册开关（--lock-register/--open-register）" "托管块幂等" "状态复用" "域名冲突 fail-fast" "--no-domain 摘除"; do
     begin "$n"; skip "需要 TEST_DOMAIN 且必须解析到本机公网 IP"
   done
 fi
