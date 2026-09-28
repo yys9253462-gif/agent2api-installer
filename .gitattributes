@@ -1,7 +1,8 @@
 # 强制所有文本文件以 LF 入库、以 LF 检出。
-# 原因：本仓库的核心产物是 shell 脚本，一旦被转成 CRLF，在 Linux 上会
-# 直接报 "bash: $'': command not found"。Windows 用户若开了 core.autocrlf=true，
-# 没有这一行就会把脚本克隆成 CRLF。
+# 原因：本仓库的核心产物是 shell 脚本，一旦被转成 CRLF，在 Linux 上会直接报
+#   bash: $'\r': command not found
+# Windows 用户若开启 core.autocrlf=true（本机 PortableGit 的 system 级配置默认就是 true），
+# 没有这一行就会把脚本克隆成 CRLF，再传到服务器上直接跑不起来。
 * text=auto eol=lf
 
 # 二进制文件不要被当文本处理
