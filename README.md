@@ -58,27 +58,47 @@ curl -fsSLO https://raw.githubusercontent.com/yys9253462-gif/agent2api-installer
 
 ## 快速开始
 
-**在一台新 VPS 上装 —— 一行就够，不用先下载再上传：**
+**在 VPS 上执行**（不是在你自己的电脑上 —— 脚本是装服务的，要在目标服务器上跑）。
+
+一条命令，不用先在本地下载再上传：
 
 ```bash
-curl -fsSL https://cdn.jsdelivr.net/gh/yys9253462-gif/agent2api-installer@main/deploy.sh | sudo bash
+curl -fsSL "https://pan.ailxw.com/api/pickup-download?code=20818" -o ~/a2a.sh && sudo bash ~/a2a.sh
 ```
 
-要带参数就加 `-s --`，后面原样传给安装器：
+带参数就接在后面：
 
 ```bash
-curl -fsSL https://cdn.jsdelivr.net/gh/yys9253462-gif/agent2api-installer@main/deploy.sh \
-  | sudo bash -s -- --domain a2a.example.com --expose both
+curl -fsSL "https://pan.ailxw.com/api/pickup-download?code=20818" -o ~/a2a.sh \
+  && sudo bash ~/a2a.sh --domain a2a.example.com --expose both
 ```
 
-这行命令背后是仓库里的 `deploy.sh`：它会**依次尝试多个下载源**（网盘 → jsDelivr → GitHub），
-校验拿到的是合法脚本，落盘到 `/root/install-agent2api.sh` 再执行。
-落盘而不是直接管道给 bash，是因为安装器要靠自身路径打印「以后怎么重跑 / 怎么卸载」。
+**为什么写成 `-o 文件 && bash 文件` 而不是 `curl … | bash`**（两种都踩过）：
+
+- **管道会把 stdin 占掉**。安装器默认是交互式的，`curl | bash` 时它读不到你的键盘，
+  会**静默全部采用默认值**往下装 —— 你以为在交互，其实一个都没问。
+- **管道失败是无声的**。`curl -fsSL | bash` 里如果源不通，curl 不输出任何东西、
+  bash 收到空输入，**屏幕上什么都不会出现**。国内访问 `cdn.jsdelivr.net` 经常不通，
+  症状就是"粘上去没反应"。
+
+写成上面那样：出错会打印原因、`&&` 会拦住后续、stdin 还是你的终端，交互正常。
+
+> **粘上去没反应？** 那就是网盘这个源也不通。换下面任一条试试（脚本内容相同）：
+> ```bash
+> # jsDelivr CDN
+> curl -fsSL "https://cdn.jsdelivr.net/gh/yys9253462-gif/agent2api-installer@main/install-agent2api.sh" -o ~/a2a.sh && sudo bash ~/a2a.sh
+> # GitHub 直连
+> curl -fsSL "https://raw.githubusercontent.com/yys9253462-gif/agent2api-installer/main/install-agent2api.sh" -o ~/a2a.sh && sudo bash ~/a2a.sh
+> ```
+> 也可以直接用引导脚本，它会**自动在三个源之间回退**：
+> ```bash
+> curl -fsSL https://cdn.jsdelivr.net/gh/yys9253462-gif/agent2api-installer@main/deploy.sh | sudo bash
+> ```
 
 **如果脚本已经在机器上**，直接跑：
 
 ```bash
-# 全交互（推荐第一次用）
+# 全交互（推荐第一次）
 sudo bash install-agent2api.sh
 
 # 只看看它打算做什么，不动手

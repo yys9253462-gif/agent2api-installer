@@ -66,4 +66,20 @@ fi
 say "------------------------------------------------------------"
 echo
 
-exec bash "$TARGET" "$@"
+# 🔴 关键：这个脚本通常是「管道喂给 bash」的（curl … | sudo bash），
+#    此时 stdin 已经被 curl 用完了（EOF）。而安装器默认是**交互式**的，
+#    它读不到键盘就会静默走默认值 —— 实测 `bash install.sh < /dev/null` 一个都不问、
+#    直接用默认值往下装，用户完全不知道自己"被默认"了。
+#    所以有终端就把 stdin 接回终端。
+if [ -t 0 ]; then
+  exec bash "$TARGET" "$@"                       # 本来就是从终端来的，直接跑
+elif (exec 3</dev/tty) 2>/dev/null; then
+  # 注意：不能只用 [ -c /dev/tty ] 判断 —— 设备节点总是存在，但**没有控制终端时
+  # 打开它会 ENXIO**（实测把 --help 都搞挂了）。必须真的试开一次。
+  exec bash "$TARGET" "$@" </dev/tty             # 从管道来的 → 接回终端
+else
+  say "注意：当前没有可用的终端，交互提问会全部采用默认值。"
+  say "      想指定参数请用：sudo bash $TARGET --yes --domain 你的域名"
+  echo
+  exec bash "$TARGET" "$@" </dev/null
+fi
