@@ -5,7 +5,7 @@
 
 - **单文件**：`install-agent2api.sh`，除 docker 外无依赖
 - **版本**：v1.1.0
-- **配套回归套件**：`test-install-agent2api.sh`（36 个用例，一条命令跑完）
+- **配套回归套件**：`test-install-agent2api.sh`（37 个用例，一条命令跑完）
 - **测试状态**：已在 Debian 12 + Docker 29.8.1 上端到端实测通过（含真实域名签证书、SSE 流式、升级回滚、卸载）
 
 > ⚠️ **免责声明**：本仓库是**非官方**的第三方部署脚本，与 agent2api 上游项目及作者无任何关联，
@@ -46,7 +46,7 @@ curl -fsSLO https://raw.githubusercontent.com/yys9253462-gif/agent2api-installer
 | **集成** | `--with-manager` 登记为 workbuddy-manager 上游，网关 Key **自动从本机库读取**（免粘贴） |
 | **Nginx 用户** | 不自动改 Nginx，但打印**可直接粘贴**的 server 块 + certbot 命令（含 `proxy_buffering off`） |
 
-**自动化回归套件**：`test-install-agent2api.sh`，**36 个用例**，一条命令跑完。
+**自动化回归套件**：`test-install-agent2api.sh`，**37 个用例**，一条命令跑完。
 
 ---
 
@@ -446,7 +446,7 @@ ssh -N -L 3066:127.0.0.1:3066 -L 3065:127.0.0.1:3065 root@<服务器IP>
 | **回归套件（带域名）** | **23 通过 / 0 失败 / 0 跳过** |
 | 套件自身清理 | 无残留容器/目录/配置块；生产站 rdwb.example.net 全程 200 |
 
-**回归套件** `test-install-agent2api.sh` 把这 36 个用例固化成一条命令，改完脚本直接跑。
+**回归套件** `test-install-agent2api.sh` 把这 37 个用例固化成一条命令，改完脚本直接跑。
 
 ---
 
@@ -586,7 +586,7 @@ ssh -N -L 3066:127.0.0.1:3066 -L 3065:127.0.0.1:3065 root@<服务器IP>
 改完脚本**别再手工点**，跑这个：
 
 ```bash
-bash test-install-agent2api.sh                                    # 36 个用例（带域名与流式时全跑）
+bash test-install-agent2api.sh                                    # 37 个用例（带域名与流式时全跑）
 TEST_DOMAIN=a2a.example.com bash test-install-agent2api.sh        # 加 5 个域名/TLS 用例
 EXISTING_DOMAINS="你的站1 你的站2" bash test-install-agent2api.sh # 附带回检生产站未被影响
 # 流式用例要指向「已有真实账号」的端点（可与被测机器不是同一台）：
