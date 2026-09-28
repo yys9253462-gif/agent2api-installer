@@ -24,7 +24,7 @@
 #
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.2"
+SCRIPT_VERSION="1.2.0"
 DEFAULT_IMAGE_REPO="aimodcc/agent2api"
 DEFAULT_TAG="2.7.10"          # 已知可用版本；--tag latest 可跟最新
 DEFAULT_DIR="/opt/agent2api"
@@ -60,6 +60,7 @@ DO_CHECK_UPDATE=0        # --check-update
 DO_STATUS=0              # --status
 IMAGE_TAG_OVERRIDE=""    # --tag 显式指定的目标版本（升级时用它，别被状态文件覆盖）
 NO_DOMAIN=0              # 本次明确不要域名（会摘掉上次写入的站点块）
+ADV_GIVEN=0              # 命令行是否显式给过「高级选项」（目录/容器名/端口/内存/时区/镜像版本）
 CADDY_MODE_FORCE=""      # --caddy-mode 强制指定的反代形态
 CADDY_MODE=""           # docker | host | self | nginx | other | none
 CADDY_CONTAINER=""
@@ -144,15 +145,15 @@ choose() {  # choose <提示> <默认序号> <选项...> -> 只把序号打到 s
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --dir)          INSTALL_DIR="$2"; shift 2 ;;
-      --tag)          IMAGE_TAG="$2"; IMAGE_TAG_OVERRIDE="$2"; shift 2 ;;
-      --container)    CONTAINER="$2"; shift 2 ;;
+      --dir)          INSTALL_DIR="$2"; ADV_GIVEN=1; shift 2 ;;
+      --tag)          IMAGE_TAG="$2"; IMAGE_TAG_OVERRIDE="$2"; ADV_GIVEN=1; shift 2 ;;
+      --container)    CONTAINER="$2"; ADV_GIVEN=1; shift 2 ;;
       --domain)       DOMAIN="$2"; shift 2 ;;
       --expose)       EXPOSE_MODE="$2"; shift 2 ;;
-      --panel-port)   PANEL_PORT="$2"; shift 2 ;;
-      --gateway-port) GW_PORT="$2"; shift 2 ;;
-      --mem)          MEM_LIMIT="$2"; shift 2 ;;
-      --tz)           TZ_NAME="$2"; shift 2 ;;
+      --panel-port)   PANEL_PORT="$2"; ADV_GIVEN=1; shift 2 ;;
+      --gateway-port) GW_PORT="$2"; ADV_GIVEN=1; shift 2 ;;
+      --mem)          MEM_LIMIT="$2"; ADV_GIVEN=1; shift 2 ;;
+      --tz)           TZ_NAME="$2"; ADV_GIVEN=1; shift 2 ;;
       --cf=*)
         case "${1#--cf=}" in
           y|Y|yes|YES|true|1) BEHIND_CF="y" ;; *) BEHIND_CF="n" ;;
@@ -500,45 +501,22 @@ gather_config() {
 
   title "agent2api 安装配置"
   info "直接回车 = 用括号里的默认值"
-  [ "$ASSUME_YES" = 1 ] && info "${C_DIM}（--yes 模式：全部使用默认值）${C_OFF}"
-
-  [ -n "$INSTALL_DIR" ] || INSTALL_DIR=$(ask "安装目录" "$DEFAULT_DIR")
-  [ -n "$CONTAINER" ]   || CONTAINER=$(ask "容器名" "$DEFAULT_CONTAINER")
-  [ -n "$TZ_NAME" ]     || TZ_NAME=$(ask "容器时区" "Asia/Shanghai")
-
-  if [ -z "$IMAGE_TAG" ]; then
-    local latest; latest=$(docker_hub_latest_tag || true)
-    if [ -n "$latest" ]; then
-      IMAGE_TAG=$(ask "镜像版本（Docker Hub 最新为 $latest）" "$latest")
-    else
-      IMAGE_TAG=$(ask "镜像版本" "$DEFAULT_TAG")
-    fi
+  if [ "$ASSUME_YES" = 1 ]; then
+    info "${C_DIM}（--yes 模式：全部使用默认值）${C_OFF}"
+  elif [ ! -t 0 ]; then
+    # 🔴 不能静默！stdin 不是终端时 ask() 会直接返回默认值 —— 用户会以为"脚本坏了、一个问题都不问"。
+    warn "当前不是交互终端（stdin 不是 tty）：所有问题将自动采用默认值。"
+    info "${C_DIM}想逐项选择，请在终端里直接执行：bash $0${C_OFF}"
   fi
 
-  # 端口：自动避让
-  if [ -z "$PANEL_PORT" ]; then
-    local auto_panel; auto_panel=$(pick_port "$DEFAULT_PANEL_PORT" "" || echo "$DEFAULT_PANEL_PORT")
-    local ans; ans=$(ask "面板端口（$DEFAULT_PANEL_PORT 被占用时自动从它起找空闲）" "$auto_panel")
-    PANEL_PORT="$ans"
-  fi
-  if [ -z "$GW_PORT" ]; then
-    local auto_gw; auto_gw=$(pick_port "$DEFAULT_GW_PORT" "$PANEL_PORT" || echo "$DEFAULT_GW_PORT")
-    local ans; ans=$(ask "网关端口" "$auto_gw")
-    GW_PORT="$ans"
-  fi
-  [ "$PANEL_PORT" != "$GW_PORT" ] || die "面板端口与网关端口不能相同（都是 $PANEL_PORT）"
-
-  # 端口占用明确告警（用户手动指定的情况）
-  if ! port_free "$PANEL_PORT"; then warn "端口 $PANEL_PORT 已被占用，启动失败时脚本会自动换端口重试"; fi
-  if ! port_free "$GW_PORT";    then warn "端口 $GW_PORT 已被占用，启动失败时脚本会自动换端口重试"; fi
-
-  [ -n "$MEM_LIMIT" ] || MEM_LIMIT=$(ask "容器内存上限" "$DEFAULT_MEM")
-
-  # 域名
-  if [ -z "$DOMAIN" ]; then
-    info ""
-    info "${C_DIM}绑域名可以走 HTTPS，但需要该域名已解析到本机。不绑则只能本机/SSH 隧道访问。${C_OFF}"
-    DOMAIN=$(ask "绑定域名（留空 = 不绑）" "")
+  # ── 第 1 步：域名。它决定你后面**怎么访问**，是最关键的决策，所以放最前 ──
+  if [ -z "$DOMAIN" ] && [ "$NO_DOMAIN" != 1 ]; then
+    printf '\n' >&2
+    info "【第 1 步】要不要绑域名？"
+    printf '        %s绑  → 自动申请 HTTPS 证书，客户端用 https://你的域名/v1（推荐）%s\n' "$C_DIM" "$C_OFF"
+    printf '        %s不绑 → 只能走 SSH 隧道，客户端用 http://127.0.0.1:<网关端口>/v1%s\n' "$C_DIM" "$C_OFF"
+    printf '        %s（不绑的话，域名解析这一步和证书都不用管）%s\n' "$C_DIM" "$C_OFF"
+    DOMAIN=$(ask "域名（没有就直接回车）" "")
   fi
   if [ -n "$DOMAIN" ]; then
     DOMAIN=$(printf '%s' "$DOMAIN" | sed -E 's#^[a-zA-Z]+://##; s#/.*$##; s/\.$//')
@@ -548,7 +526,7 @@ gather_config() {
       case "$m" in 1) EXPOSE_MODE=both ;; 2) EXPOSE_MODE=panel ;; 3) EXPOSE_MODE=gateway ;; esac
     fi
     if [ -z "$LOCK_REGISTER" ]; then
-      info ""
+      printf '\n' >&2
       info "${C_DIM}agent2api 默认「首个访问者注册管理员」。域名签证书后主机名会进 CT 日志被公开索引，${C_OFF}"
       info "${C_DIM}不封注册等于把这台管理台交给陌生人。注册可改走 SSH 隧道。${C_OFF}"
       if ask_yn "从公网禁止自助注册？（强烈建议 y）" "y"; then LOCK_REGISTER="y"; else LOCK_REGISTER="n"; fi
@@ -560,10 +538,68 @@ gather_config() {
     EXPOSE_MODE="none"; LOCK_REGISTER="${LOCK_REGISTER:-y}"; BEHIND_CF="n"
   fi
 
-  # workbuddy-manager 集成
+  # ── 第 2 步：高级选项。默认**一个都不问** —— 小白不该被问容器名/时区/内存 ──
+  local adv=1
+  # 只在「交互 + 用户没在命令行给过高级参数」时才问这个开关。
+  # ⚠️ 不能用「变量是否为空」判断 —— --dir/状态文件预填都会让它们非空，开关就永远不生效了。
+  if [ "$ASSUME_YES" = 0 ] && [ -t 0 ] && [ "$ADV_GIVEN" = 0 ]; then
+    printf '\n' >&2
+    info "【第 2 步】高级选项：安装目录 / 容器名 / 端口 / 内存 / 时区 / 镜像版本"
+    info "${C_DIM}  这些默认值都挑好了，一般不用改${C_OFF}"
+    ask_yn "需要改吗？" "n" || adv=0
+  fi
+
+  if [ "$adv" = 0 ]; then
+    # 不问，但值仍要定下来（端口照样自动避让，只是不打扰用户）
+    : "${INSTALL_DIR:=$DEFAULT_DIR}"
+    : "${CONTAINER:=$DEFAULT_CONTAINER}"
+    : "${TZ_NAME:=Asia/Shanghai}"
+    : "${MEM_LIMIT:=$DEFAULT_MEM}"
+    if [ -z "$IMAGE_TAG" ]; then
+      IMAGE_TAG=$(docker_hub_latest_tag || true)
+      [ -n "$IMAGE_TAG" ] || IMAGE_TAG="$DEFAULT_TAG"
+    fi
+    [ -n "$PANEL_PORT" ] || PANEL_PORT=$(pick_port "$DEFAULT_PANEL_PORT" "" || echo "$DEFAULT_PANEL_PORT")
+    [ -n "$GW_PORT" ]    || GW_PORT=$(pick_port "$DEFAULT_GW_PORT" "$PANEL_PORT" || echo "$DEFAULT_GW_PORT")
+    [ "$PANEL_PORT" != "$GW_PORT" ] || die "面板端口与网关端口不能相同（都是 $PANEL_PORT）"
+  else
+    [ -n "$INSTALL_DIR" ] || INSTALL_DIR=$(ask "安装目录" "$DEFAULT_DIR")
+    [ -n "$CONTAINER" ]   || CONTAINER=$(ask "容器名" "$DEFAULT_CONTAINER")
+    [ -n "$TZ_NAME" ]     || TZ_NAME=$(ask "容器时区" "Asia/Shanghai")
+
+    if [ -z "$IMAGE_TAG" ]; then
+      local latest; latest=$(docker_hub_latest_tag || true)
+      if [ -n "$latest" ]; then
+        IMAGE_TAG=$(ask "镜像版本（Docker Hub 最新为 $latest）" "$latest")
+      else
+        IMAGE_TAG=$(ask "镜像版本" "$DEFAULT_TAG")
+      fi
+    fi
+
+    # 端口：自动避让
+    if [ -z "$PANEL_PORT" ]; then
+      local auto_panel; auto_panel=$(pick_port "$DEFAULT_PANEL_PORT" "" || echo "$DEFAULT_PANEL_PORT")
+      local ans; ans=$(ask "面板端口（$DEFAULT_PANEL_PORT 被占用时自动从它起找空闲）" "$auto_panel")
+      PANEL_PORT="$ans"
+    fi
+    if [ -z "$GW_PORT" ]; then
+      local auto_gw; auto_gw=$(pick_port "$DEFAULT_GW_PORT" "$PANEL_PORT" || echo "$DEFAULT_GW_PORT")
+      local ans2; ans2=$(ask "网关端口" "$auto_gw")
+      GW_PORT="$ans2"
+    fi
+    [ "$PANEL_PORT" != "$GW_PORT" ] || die "面板端口与网关端口不能相同（都是 $PANEL_PORT）"
+
+    # 端口占用明确告警（用户手动指定的情况）
+    if ! port_free "$PANEL_PORT"; then warn "端口 $PANEL_PORT 已被占用，启动失败时脚本会自动换端口重试"; fi
+    if ! port_free "$GW_PORT";    then warn "端口 $GW_PORT 已被占用，启动失败时脚本会自动换端口重试"; fi
+
+    [ -n "$MEM_LIMIT" ] || MEM_LIMIT=$(ask "容器内存上限" "$DEFAULT_MEM")
+  fi
+
+  # workbuddy-manager 集成（只在交互 + 高级选项开启时问）
   if [ -z "$MANAGER_INTEGRATE" ]; then
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'workbuddy-manager'; then
-      info ""
+    if [ "$adv" = 1 ] && docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'workbuddy-manager'; then
+      printf '\n' >&2
       if ask_yn "检测到 workbuddy-manager，要把本服务登记为它的上游吗？" "n"; then
         MANAGER_INTEGRATE="y"; else MANAGER_INTEGRATE="n"; fi
     else
@@ -1459,14 +1495,35 @@ summary() {
                printf '  %s网关：%s https://%s/v1\n' "$C_BLD" "$C_OFF" "$DOMAIN" ;;
     esac
   else
-    info "未绑域名。用 SSH 隧道访问面板："
-    printf '      %sssh -N -L %s:127.0.0.1:%s <本机>\n%s' "$C_DIM" "$PANEL_PORT" "$PANEL_PORT" "$C_OFF"
-    printf '      然后浏览器打开 http://127.0.0.1:%s\n' "$PANEL_PORT"
+    # 不绑域名时，必须把「怎么用」讲清楚。只给面板端口是不够的 ——
+    # 用户真正要连的是**网关**（客户端 base_url 填的就是它），隧道里漏了它等于装完没法用。
+    local ssh_host ssh_user
+    ssh_host=$(host_public_ip || true)
+    [ -n "$ssh_host" ] || ssh_host="<你的服务器IP>"
+    ssh_user="${SUDO_USER:-}"
+    [ -n "$ssh_user" ] || ssh_user="$(id -un 2>/dev/null || echo root)"
+
+    info "未绑域名 —— 用 SSH 隧道访问。下面这条在${C_BLD}你自己的电脑${C_OFF}上执行："
+    printf '\n'
+    printf '      %sssh -N -L %s:127.0.0.1:%s -L %s:127.0.0.1:%s %s@%s%s\n' \
+      "$C_DIM" "$PANEL_PORT" "$PANEL_PORT" "$GW_PORT" "$GW_PORT" "$ssh_user" "$ssh_host" "$C_OFF"
+    printf '\n'
+    info "${C_DIM}这条命令要一直开着（另开一个终端窗口跑）。它不输出任何东西、看着像卡住 —— 那是在转发，正常。${C_OFF}"
+    printf '\n'
+    printf '      面板 → 浏览器打开 %shttp://127.0.0.1:%s%s\n' "$C_BLD" "$PANEL_PORT" "$C_OFF"
+    printf '      网关 → 客户端 base_url 填 %shttp://127.0.0.1:%s/v1%s\n' "$C_BLD" "$GW_PORT" "$C_OFF"
+    printf '\n'
+    info "隧道只对你这台电脑有效，别人访问不到（这也是它比直接暴露公网安全的地方）。"
+    info "想省掉隧道：带上域名重跑（--domain 你的域名），会自动签 HTTPS 证书。"
   fi
   printf '\n'
   info "首次使用：打开面板 → 注册管理员 → 「账号」添加上游账号 → 「网关 Key」建一把 Key"
-  info "客户端接入：base_url = <上面的网关地址>，api_key = 面板里那把 Key"
-  [ "$LOCK_REGISTER" = "y" ] && info "${C_YEL}注意：公网自助注册已封（$SETUP_PATH → 403）。要注册请走 SSH 隧道。${C_OFF}"
+  if [ -n "$DOMAIN" ]; then
+    info "客户端接入：base_url = https://${DOMAIN}/v1，api_key = 面板里那把 Key"
+  else
+    info "客户端接入：base_url = http://127.0.0.1:${GW_PORT}/v1（走上面的隧道），api_key = 面板里那把 Key"
+  fi
+  [ "$LOCK_REGISTER" = "y" ] && info "${C_YEL}注意：公网自助注册已封（$SETUP_PATH → 403）。${C_OFF}"
   printf '\n'
   info "常用命令："
   printf '      cd %s && docker compose logs -f --tail 50\n' "$INSTALL_DIR"
