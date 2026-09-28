@@ -24,7 +24,7 @@
 #
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.1.2"
 DEFAULT_IMAGE_REPO="aimodcc/agent2api"
 DEFAULT_TAG="2.7.10"          # 已知可用版本；--tag latest 可跟最新
 DEFAULT_DIR="/opt/agent2api"
@@ -219,7 +219,16 @@ EOF
 }
 
 # ── 环境探测 ────────────────────────────────────────────────────────────────
-need_root() { [ "$(id -u)" = 0 ] || die "需要 root 权限运行（sudo bash $0 ...）"; }
+# 提示要跟着环境走：很多精简镜像（尤其登录就是 root 的）**根本没装 sudo**，
+# 无脑让人「加 sudo」会得到 `sudo: command not found`（真实用户踩过）。
+need_root() {
+  [ "$(id -u)" = 0 ] && return 0
+  if command -v sudo >/dev/null 2>&1; then
+    die "需要 root 权限运行。请改用：sudo bash $0 $*"
+  else
+    die "需要 root 权限运行，但这台机器上没有 sudo。请先 su - 切到 root，再执行：bash $0 $*"
+  fi
+}
 
 check_docker() {
   command -v docker >/dev/null 2>&1 || die "未找到 docker。请先安装 Docker 再运行本脚本。"

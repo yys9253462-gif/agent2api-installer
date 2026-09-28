@@ -29,7 +29,12 @@ SOURCES=(
 say() { printf '  %s\n' "$1"; }
 
 if [ "$(id -u)" != 0 ]; then
-  echo "请用 root 运行（命令前面加 sudo）" >&2
+  # 别无脑提示「加 sudo」—— 很多精简镜像根本没装 sudo（登录就是 root）
+  if command -v sudo >/dev/null 2>&1; then
+    echo "需要 root 权限。请改用：curl -fsSL <本脚本地址> | sudo bash" >&2
+  else
+    echo "需要 root 权限，但这台机器上没有 sudo。请先 su - 切到 root 再执行。" >&2
+  fi
   exit 1
 fi
 for c in curl bash; do

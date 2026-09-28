@@ -60,7 +60,15 @@ curl -fsSLO https://raw.githubusercontent.com/yys9253462-gif/agent2api-installer
 
 **在 VPS 上执行**（不是在你自己的电脑上 —— 脚本是装服务的，要在目标服务器上跑）。
 
-一条命令，不用先在本地下载再上传：
+一条命令，不用先在本地下载再上传。
+
+**如果你的提示符是 `#`（登录就是 root，多数 VPS 默认如此）**：
+
+```bash
+curl -fsSL "https://pan.ailxw.com/api/pickup-download?code=20818" -o ~/a2a.sh && bash ~/a2a.sh
+```
+
+**如果你的提示符是 `$`（普通用户）**，把最后的 `bash` 换成 `sudo bash`：
 
 ```bash
 curl -fsSL "https://pan.ailxw.com/api/pickup-download?code=20818" -o ~/a2a.sh && sudo bash ~/a2a.sh
@@ -70,8 +78,12 @@ curl -fsSL "https://pan.ailxw.com/api/pickup-download?code=20818" -o ~/a2a.sh &&
 
 ```bash
 curl -fsSL "https://pan.ailxw.com/api/pickup-download?code=20818" -o ~/a2a.sh \
-  && sudo bash ~/a2a.sh --domain a2a.example.com --expose both
+  && bash ~/a2a.sh --domain a2a.example.com --expose both
 ```
+
+> ⚠️ **别习惯性地加 `sudo`**。很多精简镜像（尤其登录就是 root 的）**根本没装 sudo**，
+> 加了会直接报 `sudo: command not found`，后面还会跟一个 `curl: (23) Failed writing body`
+> —— 看着像网络问题，其实是 sudo 不存在。**先看提示符是 `#` 还是 `$`。**
 
 **为什么写成 `-o 文件 && bash 文件` 而不是 `curl … | bash`**（两种都踩过）：
 
@@ -94,6 +106,16 @@ curl -fsSL "https://pan.ailxw.com/api/pickup-download?code=20818" -o ~/a2a.sh \
 > ```bash
 > curl -fsSL https://cdn.jsdelivr.net/gh/yys9253462-gif/agent2api-installer@main/deploy.sh | sudo bash
 > ```
+
+## 常见报错（都是真实遇到过的）
+
+| 你看到的 | 真正的原因 | 怎么办 |
+| --- | --- | --- |
+| `sudo: command not found` 后面跟 `curl: (23) Failed writing body` | 你**登录就是 root**，而这台机器**没装 sudo** | 去掉 `sudo`，直接 `bash ~/a2a.sh`。先看提示符是 `#`（root）还是 `$`（普通用户） |
+| 粘上去**一点输出都没有**，光标直接回来 | 下载源不通（`curl -fsSL … \| bash` 的失败是**无声的**） | 换源（见上面三个源），或改用 `-o 文件 && bash 文件` 的写法 |
+| `docker: command not found` | 机器上还没装 Docker | 先装：`curl -fsSL https://get.docker.com \| sh`（或按发行版官方文档） |
+| `需要 root 权限运行…` | 你是普通用户 | 按提示把 `bash` 换成 `sudo bash` |
+| `80/443 被 xxx 占用` | 机器上已有反代（Nginx 等）在跑 | 脚本会打印可直接粘贴的 Nginx 片段；或腾出 80/443 后用 `--caddy-mode self` |
 
 **如果脚本已经在机器上**，直接跑：
 
