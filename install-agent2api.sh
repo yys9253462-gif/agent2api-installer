@@ -24,7 +24,7 @@
 #
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.5.1"
+SCRIPT_VERSION="1.6.0"
 DEFAULT_IMAGE_REPO="aimodcc/agent2api"
 DEFAULT_TAG="2.7.10"          # 已知可用版本；--tag latest 可跟最新
 DEFAULT_DIR="/opt/agent2api"
@@ -77,6 +77,20 @@ LAST_FAIL_KIND=""       # start_container 设置的失败类型：port | name | 
 # 改共享反代配置的过程中被打断（Ctrl-C / 被 kill），把配置还原回去。
 # 不管的话会留下半截无效配置 —— 它当下不发作（运行中的 Caddy 还用着旧配置），
 # 等到下次 reload 或重启才炸，是最难排查的那类故障。
+
+# 备份文件要**限量**：每次改共享反代配置都会存一份，
+# 用户来回折腾几次就在 /etc/caddy/ 里堆一排（实测连跑 4 次 = 4 个）。
+# 只保留最近 3 个 —— 只删**本脚本自己建的**（严格匹配文件名模式），
+# 绝不碰用户自己的备份。
+prune_own_backups() {
+  local dir; dir="$(dirname "$CADDY_FILE")"
+  local base; base="$(basename "$CADDY_FILE")"
+  local keep=3
+  ls -1t "$dir/$base".bak-*-preAgent2API 2>/dev/null \
+    | tail -n +$((keep + 1)) \
+    | while IFS= read -r f; do rm -f "$f"; done
+}
+
 on_signal() {
   if [ "$CADDY_BACKED_UP" = 1 ] && [ -n "$BACKUP_FILE" ] && [ -f "$BACKUP_FILE" ]; then
     printf '\n' >&2
@@ -89,8 +103,11 @@ on_signal() {
     fi
   fi
   printf '  %s已中止。%s\n' "$C_YEL" "$C_OFF" >&2
-  printf '  %s配置已还原到你运行前的状态，没有改坏任何东西。%s\n' "$C_DIM" "$C_OFF" >&2
-  printf '  %s（如果之前已经装好过、这次只是重跑：服务还在，重跑一次脚本就能接着用）%s\n' "$C_DIM" "$C_OFF" >&2
+  printf '  %s反代配置已还原到你运行前的状态，没有改坏任何东西。%s\n' "$C_DIM" "$C_OFF" >&2
+  # 说实话：中断时可能已经起了容器（实测：在下载镜像阶段杀掉，容器已存在但状态文件还没写）。
+  # 只说"什么都没发生"会让用户以为环境是干净的。
+  printf '  %s如果刚才已经跑到「启动服务」那一步，容器可能已经建起来了（但不影响使用）。%s\n' "$C_DIM" "$C_OFF" >&2
+  printf '  %s直接重跑一次脚本就能接上（不会重复装）。%s\n' "$C_DIM" "$C_OFF" >&2
   exit 130
 }
 trap on_signal INT TERM
@@ -131,14 +148,24 @@ ask_yn() {  # ask_yn <提示> <y|n> -> 返回 0=是
   local prompt="$1" def="$2" ans=""
   if [ "$ASSUME_YES" = 1 ] || [ ! -t 0 ]; then [ "$def" = "y" ]; return; fi
   printf '  %s [%s]: ' "$prompt" "$def" >&2
-  # 🔴 EOF 绝不能当成"回车确认默认值"：确认安装的默认是 y，
-  # 那样输入一断就会**直接开装**。读不到就按「否」处理。
-  if ! IFS= read -r ans; then
-    printf '\n  %s（读不到输入，按「否」处理）%s\n' "$C_DIM" "$C_OFF" >&2
-    return 1
-  fi
-  ans="${ans:-$def}"
-  case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+  while :; do
+    # 🔴 EOF 绝不能当成"回车确认默认值"：确认安装的默认是 y，
+    # 那样输入一断就会**直接开装**。读不到就按「否」处理。
+    if ! IFS= read -r ans; then
+      printf '\n  %s（读不到输入，按「否」处理）%s\n' "$C_DIM" "$C_OFF" >&2
+      return 1
+    fi
+    case "$ans" in
+      '') [ "$def" = "y" ] && return 0 || return 1 ;;
+      # 中文用户会直接打「是 / 好 / 对 / 要」—— 实测以前这些都落进 `*)` 被当成**否**，
+      # 等于回答了相反的意思（问"要不要禁止…"，答"是"结果没禁止）。
+      y|Y|yes|YES|Yes|true|1|是|是的|好|好的|对|要|嗯|可以|行|确定) return 0 ;;
+      n|N|no|NO|No|false|0|否|不|不要|不用|不是|取消) return 1 ;;
+      *) printf '  %s没看懂「%s」—— 请回答 y（是）或 n（否），直接回车则用默认值 %s%s\n' \
+           "$C_YEL" "$ans" "$def" "$C_OFF" >&2
+         printf '  %s [%s]: ' "$prompt" "$def" >&2 ;;
+    esac
+  done
 }
 
 # 带格式校验的提问：交互模式下**当场重问**，别让用户填错一个字符就得重跑一遍、
@@ -170,11 +197,21 @@ choose() {  # choose <提示> <默认序号> <选项...> -> 只把序号打到 s
   for o in "${opts[@]}"; do printf '    %d) %s\n' "$i" "$o" >&2; i=$((i+1)); done
   if [ "$ASSUME_YES" = 1 ] || [ ! -t 0 ]; then printf '%s' "$def"; return 0; fi
   printf '  %s [%s]: ' "$prompt" "$def" >&2
-  read -r ans || true
-  ans="${ans:-$def}"
-  case "$ans" in ''|*[!0-9]*) printf '%s' "$def" ;; *)
-    if [ "$ans" -ge 1 ] && [ "$ans" -le "${#opts[@]}" ]; then printf '%s' "$ans"; else printf '%s' "$def"; fi ;;
-  esac
+  while :; do
+    if ! IFS= read -r ans; then
+      printf '\n  %s（读不到输入，用默认值 %s）%s\n' "$C_DIM" "$def" "$C_OFF" >&2
+      printf '%s' "$def"; return 0
+    fi
+    case "$ans" in
+      '') printf '%s' "$def"; return 0 ;;
+    esac
+    # 越界或非数字**重问**：以前会静默回落成默认项，用户输 9 却跑了第 1 项，很意外
+    if printf '%s' "$ans" | grep -qE '^[0-9]+$' && [ "$ans" -ge 1 ] && [ "$ans" -le "${#opts[@]}" ]; then
+      printf '%s' "$ans"; return 0
+    fi
+    printf '  %s请输入 1-%s 之间的数字（直接回车用默认 %s）%s\n' "$C_YEL" "${#opts[@]}" "$def" "$C_OFF" >&2
+    printf '  %s [%s]: ' "$prompt" "$def" >&2
+  done
 }
 
 # ── 参数解析 ────────────────────────────────────────────────────────────────
@@ -1227,6 +1264,7 @@ apply_domain() {
   BACKUP_FILE="${CADDY_FILE}.bak-$(date +%Y%m%d-%H%M%S)-preAgent2API"
   cp "$CADDY_FILE" "$BACKUP_FILE"; CADDY_BACKED_UP=1
   ok "已备份 Caddyfile → $(basename "$BACKUP_FILE")"
+  prune_own_backups   # 只留最近 3 份自己的备份，别往系统目录堆垃圾
 
   strip_managed_block "$CADDY_FILE"          # 幂等：先摘掉旧的本脚本托管块
 
@@ -1433,7 +1471,7 @@ NGINX
 
 # ── 版本管理：查更新 / 升级 / 状态 ──────────────────────────────────────────
 do_check_update() {
-  load_state || die "读不到 $INSTALL_DIR/install.conf（用 --dir 指定安装目录）"
+  need_state
   title "检查更新"
   info "当前版本：${IMAGE_TAG}"
   local latest; latest=$(docker_hub_latest_tag || true)
@@ -1451,7 +1489,7 @@ do_check_update() {
 }
 
 do_upgrade() {
-  load_state || die "读不到 $INSTALL_DIR/install.conf（用 --dir 指定安装目录）"
+  need_state
   title "升级 agent2api"
   local target="$IMAGE_TAG_OVERRIDE"
   if [ -z "$target" ]; then
@@ -1513,8 +1551,26 @@ do_upgrade() {
   fi
 }
 
+# 读安装状态文件；读不到就给出**能照着做**的提示。
+# 原来三处都只说「读不到 xxx/install.conf（用 --dir 指定安装目录）」——
+# 可用户明明已经传了 --dir，真正的原因是"上次装到一半中断了、状态文件还没写"，
+# 那句话会把人带偏（实测：中断后跑 --status 就撞上这个）。
+need_state() {
+  load_state && return 0
+  if [ -d "$INSTALL_DIR" ]; then
+    problem "在 $INSTALL_DIR 里没找到安装记录（install.conf）"
+    info "多半是上次装到一半中断了。直接重跑脚本就能接着装："
+    printf '      %sbash %s --dir %s%s\n' "$C_BLD" "$0" "$INSTALL_DIR" "$C_OFF"
+  else
+    problem "这台机器上还没装过（$INSTALL_DIR 不存在）"
+    info "先跑一次安装就行："
+    printf '      %sbash %s%s\n' "$C_BLD" "$0" "$C_OFF"
+  fi
+  die "已中止（未做任何改动）。"
+}
+
 do_status() {
-  load_state || die "读不到 $INSTALL_DIR/install.conf（用 --dir 指定安装目录）"
+  need_state
   title "运行状态"
   info "安装目录：$INSTALL_DIR"
   info "程序：${DEFAULT_IMAGE_REPO}:${IMAGE_TAG}"
@@ -1691,7 +1747,11 @@ summary() {
   # ── 进面板之后要做的三件事（小白最容易卡在「建了 Key 但没有模型」）──
   printf '\n'
   info "进面板之后，按这个顺序做三件事："
-  printf '      %s①%s 在「账号」里加上你的 AI 上游账号（少了这步，客户端会拿不到任何模型）\n' "$C_BLD" "$C_OFF"
+  # 措辞是实测出来的：原来只说"加上你的 AI 上游账号"，小白根本不知道指什么。
+  # 面板实际支持这些 AI 工具的账号（实测 /api/accounts 拿到 14 种），把例子列出来他才明白要准备什么。
+  printf '      %s①%s 在「账号」里加上游账号 —— 面板会列出支持的类型：\n' "$C_BLD" "$C_OFF"
+  printf '         %sWorkBuddy / 小浣熊 / Qoder / Trae / Cline / Accio / ZCode / CatPaw / CodeArts …%s\n' "$C_DIM" "$C_OFF"
+  printf '         %s选一个你有的，按提示登录或填 Key。少了这步，客户端拿不到任何模型%s\n' "$C_DIM" "$C_OFF"
   printf '      %s②%s 在「网关 Key」里建一把 Key（客户端要用它）\n' "$C_BLD" "$C_OFF"
   printf '      %s③%s 把它填到你的 AI 工具里（见下面「客户端里怎么填」）\n' "$C_BLD" "$C_OFF"
 
