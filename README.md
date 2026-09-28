@@ -146,6 +146,47 @@ ssh -N -L 3066:127.0.0.1:3066 -L 3065:127.0.0.1:3065 root@<你的服务器IP>
 
 **嫌麻烦就绑个域名**：带 `--domain 你的域名` 重跑，自动签 HTTPS 证书，之后就不用隧道了。
 
+### 隧道每次都要输密码？配一次免密（30 秒）
+
+在**你自己的电脑**上做（Windows 的 CMD / PowerShell / Git Bash 都行）：
+
+```bat
+:: 1) 生成一把专用于这台服务器的密钥（一路回车，不用设密码短语）
+ssh-keygen -t ed25519 -f %USERPROFILE%\.ssh\a2a-vps -C a2a-vps
+
+:: 2) 把公钥装到服务器上 —— 这一步要输一次密码，之后就再也不用输了
+type %USERPROFILE%\.ssh\a2a-vps.pub | ssh root@你的服务器IP "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+
+:: 3) 验证：这条应该不再问密码
+ssh -i %USERPROFILE%\.ssh\a2a-vps root@你的服务器IP echo ok
+```
+
+（Linux/macOS 上用 `ssh-copy-id -i ~/.ssh/a2a-vps.pub root@你的服务器IP` 代替第 2 步。）
+
+**更省事：把隧道写进 SSH 配置，以后一条命令搞定。** 编辑 `%USERPROFILE%\.ssh\config`，加：
+
+```
+Host a2a
+    HostName 你的服务器IP
+    User root
+    IdentityFile ~/.ssh/a2a-vps
+    LocalForward 3066 127.0.0.1:3066
+    LocalForward 3065 127.0.0.1:3065
+    ExitOnForwardFailure yes
+```
+
+以后只要：
+
+```bat
+ssh -N a2a
+```
+
+两个端口就都转好了，不问密码。（`-N` = 只转发不开 shell。这条命令要一直开着，`Ctrl+C` 停。）
+
+> ⚠️ **关于密码**：不要让别人（包括 AI）把服务器密码打印到聊天记录或终端里 ——
+> 那会同时留在聊天历史、命令历史和对方上下文里。用密钥才是正解：
+> 私钥只在你本机，服务器上只放公钥，泄了也偷不走。**
+
 ---
 
 ## 常见报错（都是真实遇到过的）
