@@ -1,0 +1,11 @@
+# 强制所有文本文件以 LF 入库、以 LF 检出。
+# 原因：本仓库的核心产物是 shell 脚本，一旦被转成 CRLF，在 Linux 上会
+# 直接报 "bash: $'': command not found"。Windows 用户若开了 core.autocrlf=true，
+# 没有这一行就会把脚本克隆成 CRLF。
+* text=auto eol=lf
+
+# 二进制文件不要被当文本处理
+*.png  binary
+*.jpg  binary
+*.gz   binary
+*.tar  binary
