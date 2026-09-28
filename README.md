@@ -58,6 +58,25 @@ curl -fsSLO https://raw.githubusercontent.com/yys9253462-gif/agent2api-installer
 
 ## 快速开始
 
+**在一台新 VPS 上装 —— 一行就够，不用先下载再上传：**
+
+```bash
+curl -fsSL https://cdn.jsdelivr.net/gh/yys9253462-gif/agent2api-installer@main/deploy.sh | sudo bash
+```
+
+要带参数就加 `-s --`，后面原样传给安装器：
+
+```bash
+curl -fsSL https://cdn.jsdelivr.net/gh/yys9253462-gif/agent2api-installer@main/deploy.sh \
+  | sudo bash -s -- --domain a2a.example.com --expose both
+```
+
+这行命令背后是仓库里的 `deploy.sh`：它会**依次尝试多个下载源**（网盘 → jsDelivr → GitHub），
+校验拿到的是合法脚本，落盘到 `/root/install-agent2api.sh` 再执行。
+落盘而不是直接管道给 bash，是因为安装器要靠自身路径打印「以后怎么重跑 / 怎么卸载」。
+
+**如果脚本已经在机器上**，直接跑：
+
 ```bash
 # 全交互（推荐第一次用）
 sudo bash install-agent2api.sh

@@ -24,7 +24,7 @@
 #
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 DEFAULT_IMAGE_REPO="aimodcc/agent2api"
 DEFAULT_TAG="2.7.10"          # 已知可用版本；--tag latest 可跟最新
 DEFAULT_DIR="/opt/agent2api"
@@ -1462,9 +1462,15 @@ summary() {
   info "常用命令："
   printf '      cd %s && docker compose logs -f --tail 50\n' "$INSTALL_DIR"
   printf '      cd %s && docker compose restart\n' "$INSTALL_DIR"
+  printf '      bash %s --status\n' "$0"
+  printf '      bash %s --upgrade\n' "$0"
   printf '      bash %s --uninstall\n' "$0"
   printf '\n'
   info "状态文件：$(state_file)（改完重跑脚本即可生效）"
+  printf '\n'
+  # 换新机器时不用再手动下载上传 —— 直接把这行粘到新 VPS 上
+  info "要在别的机器上装，把下面这行粘过去就行（不用先下载再上传）："
+  printf '      curl -fsSL https://cdn.jsdelivr.net/gh/yys9253462-gif/agent2api-installer@main/deploy.sh | sudo bash\n'
 }
 
 # ── 主流程 ──────────────────────────────────────────────────────────────────
