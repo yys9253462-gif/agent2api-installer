@@ -20,9 +20,13 @@
 >    任何对该镜像有 push 权限的人，都能改变你机器上跑的程序。
 > 2. **tag 是可变的**：默认行为是去 Docker Hub 查「最新版」并直接使用。生产环境建议用
 >    `--tag <具体版本号>` 锁死；装完脚本会打印镜像的**内容摘要 sha256**，可用于事后核对。
-> 3. `deploy.sh` 会依次尝试 3 个源，其中**第一个是网盘静态副本**。它会做三级校验：
->    shebang → 是否含 `SCRIPT_VERSION` → （可选）SHA256 比对。
->    想强制校验，见下面的「核对安装器完整性」。
+> 3. `deploy.sh` 会依次尝试 **2 个源**：`raw.githubusercontent`（内容恒等于 main，无缓存期）
+>    优先，`cdn.jsdelivr` 兜底。它会做四级校验：
+>    shebang → 是否含 `SCRIPT_VERSION` → **版本号 ≥ `A2A_MIN_VERSION`（默认 1.7.1）** →（可选）SHA256 比对。
+>    🔴 **版本下限这道是必需的**：CDN 有缓存延迟，实测推了 v1.7.1 之后 jsDelivr
+>    仍在发 v1.7.0——而旧文件 shebang、版本号、语法**全都正常**，
+>    没有这道检查用户会**静默地装上旧版且毫不知情**。
+>    想强制校验，见下面的「核对安装器完整性」；想放宽用 `A2A_MIN_VERSION=""`。
 
 ---
 
@@ -36,7 +40,15 @@ curl -fsSLO https://raw.githubusercontent.com/yys9253462-gif/agent2api-installer
 curl -fsSLO https://raw.githubusercontent.com/yys9253462-gif/agent2api-installer/main/test-install-agent2api.sh
 ```
 
-国内访问 GitHub 不稳，也可以走网盘（永久取件码 **20818**）：<https://pan.ailxw.com/pickup/20818>
+国内网络访问 GitHub 不稳时，用 jsDelivr 拿**同一份**文件：
+
+```bash
+curl -fsSLO https://cdn.jsdelivr.net/gh/yys9253462-gif/agent2api-installer@main/install-agent2api.sh
+```
+
+> ⚠️ jsDelivr 是 CDN，**有缓存延迟**（实测推了新版后它仍发旧版，通常几分钟到几小时）。
+> 拿到的版本不对就等一会儿，或改用上面的 `raw.githubusercontent` 地址。
+> `deploy.sh` 已经内置了「版本下限」检查，遇到旧版会自动换源并在全失败时明确告诉你原因。
 
 ### 核对安装器完整性
 
@@ -89,19 +101,19 @@ EXPECT_SHA256=<上面算出的 64 位摘要> \
 **如果你的提示符是 `#`（登录就是 root，多数 VPS 默认如此）**：
 
 ```bash
-curl -fsSL "https://pan.ailxw.com/api/pickup-download?code=20818" -o ~/a2a.sh && bash ~/a2a.sh
+curl -fsSL https://raw.githubusercontent.com/yys9253462-gif/agent2api-installer/main/install-agent2api.sh -o ~/a2a.sh && bash ~/a2a.sh
 ```
 
 **如果你的提示符是 `$`（普通用户）**，把最后的 `bash` 换成 `sudo bash`：
 
 ```bash
-curl -fsSL "https://pan.ailxw.com/api/pickup-download?code=20818" -o ~/a2a.sh && sudo bash ~/a2a.sh
+curl -fsSL https://raw.githubusercontent.com/yys9253462-gif/agent2api-installer/main/install-agent2api.sh -o ~/a2a.sh && sudo bash ~/a2a.sh
 ```
 
 带参数就接在后面：
 
 ```bash
-curl -fsSL "https://pan.ailxw.com/api/pickup-download?code=20818" -o ~/a2a.sh \
+curl -fsSL https://raw.githubusercontent.com/yys9253462-gif/agent2api-installer/main/install-agent2api.sh -o ~/a2a.sh \
   && bash ~/a2a.sh --domain a2a.example.com --expose both
 ```
 
@@ -114,21 +126,18 @@ curl -fsSL "https://pan.ailxw.com/api/pickup-download?code=20818" -o ~/a2a.sh \
 - **管道会把 stdin 占掉**。安装器默认是交互式的，`curl | bash` 时它读不到你的键盘，
   会**静默全部采用默认值**往下装 —— 你以为在交互，其实一个都没问。
 - **管道失败是无声的**。`curl -fsSL | bash` 里如果源不通，curl 不输出任何东西、
-  bash 收到空输入，**屏幕上什么都不会出现**。国内访问 `cdn.jsdelivr.net` 经常不通，
-  症状就是"粘上去没反应"。
+  bash 收到空输入，**屏幕上什么都不会出现**。
 
 写成上面那样：出错会打印原因、`&&` 会拦住后续、stdin 还是你的终端，交互正常。
 
-> **粘上去没反应？** 那就是网盘这个源也不通。换下面任一条试试（脚本内容相同）：
+> **粘上去没反应？** 那就是 `raw.githubusercontent` 不通。换下面任一条试试（同一份文件）：
 > ```bash
-> # jsDelivr CDN
+> # jsDelivr CDN（国内更快，但有缓存延迟，可能拿到旧版）
 > curl -fsSL "https://cdn.jsdelivr.net/gh/yys9253462-gif/agent2api-installer@main/install-agent2api.sh" -o ~/a2a.sh && sudo bash ~/a2a.sh
-> # GitHub 直连
-> curl -fsSL "https://raw.githubusercontent.com/yys9253462-gif/agent2api-installer/main/install-agent2api.sh" -o ~/a2a.sh && sudo bash ~/a2a.sh
 > ```
-> 也可以直接用引导脚本，它会**自动在三个源之间回退**：
+> 也可以直接用引导脚本，它会**自动在两个源之间回退，并拒绝旧版本**：
 > ```bash
-> curl -fsSL https://cdn.jsdelivr.net/gh/yys9253462-gif/agent2api-installer@main/deploy.sh | sudo bash
+> curl -fsSL https://raw.githubusercontent.com/yys9253462-gif/agent2api-installer/main/deploy.sh | sudo bash
 > ```
 
 ## 交互流程（默认只问 2 个问题）
@@ -261,7 +270,7 @@ ssh -N a2a
 | 你看到的 | 真正的原因 | 怎么办 |
 | --- | --- | --- |
 | `sudo: command not found` 后面跟 `curl: (23) Failed writing body` | 你**登录就是 root**，而这台机器**没装 sudo** | 去掉 `sudo`，直接 `bash ~/a2a.sh`。先看提示符是 `#`（root）还是 `$`（普通用户） |
-| 粘上去**一点输出都没有**，光标直接回来 | 下载源不通（`curl -fsSL … \| bash` 的失败是**无声的**） | 换源（见上面三个源），或改用 `-o 文件 && bash 文件` 的写法 |
+| 粘上去**一点输出都没有**，光标直接回来 | 下载源不通（`curl -fsSL … \| bash` 的失败是**无声的**） | 换源（见上面两个源），或改用 `-o 文件 && bash 文件` 的写法 |
 | `docker: command not found` | 机器上还没装 Docker | **脚本会自动帮你装**（不用管）；加了 `--no-deps` 时才只打印命令给你 |
 | 隧道命令报 `Permission denied` | 你平时不是用密码登录这台机器（配了别名/密钥） | 把你平时那条 ssh 命令后面加上 `-N -L 面板端口:127.0.0.1:面板端口 -L 网关端口:127.0.0.1:网关端口` |
 | `需要 root 权限运行…` | 你是普通用户 | 按提示把 `bash` 换成 `sudo bash` |
@@ -691,10 +700,13 @@ RUN_GROUPS=A,A2 bash test-install-agent2api.sh                      # 参数校�
 
 | 问题 | 修法 |
 | --- | --- |
-| `deploy.sh` 只做 `bash -n`，网盘静态副本能被换掉而不被发现 | 三级校验：shebang → 含 `SCRIPT_VERSION` →（可选）`EXPECT_SHA256` 比对 |
+| `deploy.sh` 只做 `bash -n`，静态副本能被换掉而不被发现 | 四道校验：shebang → 含 `SCRIPT_VERSION` → **版本 ≥ `A2A_MIN_VERSION`** →（可选）`EXPECT_SHA256` 比对 |
+| **网盘静态副本已从分发链移除**（取件码 20818 长期停在 v1.7.0；更糟的是它背后的对象已不在网盘账号管理范围内 —— `/api/files` 列不出、`/api/storage-usage` 却计入，谁都覆盖不了它） | 源改为 `raw.githubusercontent`（恒等于 main、无缓存期）+ `cdn.jsdelivr`（兜底）两个，都直接指向 GitHub |
+| **CDN 把旧版本发给用户，而旧文件 shebang / 版本号 / 语法全都正常**，前几道校验一律放行 —— 用户静默装上旧版且不知情（实测：推了 v1.7.1 后 jsDelivr 仍在发 v1.7.0） | 新增**版本下限**检查（`A2A_MIN_VERSION`，默认 1.7.1，用 `sort -V` 比避免 `1.7.10 < 1.7.1` 的字典序陷阱）；旧版一律换下一个源，全失败时明确告诉用户是缓存问题并给出手工下载地址 |
 | **校验失败后，不合格的内容仍然留在 `$TARGET` 上**（默认 `/root/install-agent2api.sh`）——用户手动跑它，跑的就是没通过校验的文件 | 改成**先下到临时文件，校验通过才 `install` 到目标路径**；失败时目标路径完全不被碰 |
 | 跑起来后看不出到底在跑哪个镜像内容 | 打印镜像内容摘要 `sha256:…`；用 `latest` 时显式警告 tag 可变 |
 | 回归套件**从未在提交时自动跑**（仓库无 CI） | 新增 GitHub Actions：`static` / `regression`（A、A2 组）+ `smoke` |
+| `A2A_MIN_VERSION=""` 明明想「关闭版本下限检查」，却关不掉 —— 一直按 1.7.1 拦 | `${VAR:-default}` 把「空字符串」也当成未设置。改用 `${VAR-default}`（不带冒号）：已设置就认（空串＝关闭），没设置才取默认。**实测用例表里那条「放宽」用例就是这么红掉的** |
 
 ### 测试套件本身修的（这几条只有真跑才暴露）
 
@@ -714,8 +726,11 @@ RUN_GROUPS=A,A2 bash test-install-agent2api.sh                      # 参数校�
 | 全部文件 CR 计数 | 0 |
 | `RUN_GROUPS=A,A2` 回归 | **18 通过 / 0 失败 / 0 跳过，RC=0** |
 | `smoke` 6 条错误路径 | 全通过（每条都断言「rc≠0 **且** 输出含预期文案」） |
-| `deploy.sh` 三级校验（对 / 错 / 不设 三种情况） | 行为均符合预期，失败时目标路径零污染 |
+| `deploy.sh` 四道校验（对 / 错 / 不设 SHA256 / 版本过旧） | 行为均符合预期，失败时目标路径零污染 |
+| **版本下限真拦住了 CDN 旧版** | 实测 5 条用例：① 默认下限 → raw.githubusercontent 直接过 v1.7.1；② 下限抬到 1.7.9 → 两源都被拒且给出「CDN 缓存」解释 + 手工下载地址；③ 只留 jsDelivr → 明确报「拿到的是 v1.7.0，比要求的旧」；④ `A2A_MIN_VERSION=""` → 旧版被接受（**这条第一版是红的**，见上表）；⑤ `sort -V` 比较 6/6（`1.7.10 ≥ 1.7.1`、`1.7.2 < 1.7.10` 等字典序会判错的情况全对）。**失败时目标路径均未落盘** |
+| 曾想加的第三个源 `raw.gitmirror.com` | **实测该域名不存在**，已删掉 —— 加源前必须先 curl 验一遍，不能照抄网上的「GitHub 加速镜像」清单 |
 | **生产环境复核** | 容器列表、监听端口、`/opt/agent2api/docker-compose.yml` 与 `Caddyfile` 的 SHA256 **逐项与测试前基线一致**，测试残留为零 |
+| 网盘侧试验残留 | 上传/删除后复核：根目录回到原有 8 个文件，试验产物零残留，临时取件码已失效；原有分享未动 |
 
 > ⚠️ **仍未验证**（诚实列出，别把上面那张表读成「一切都验过了」）：
 >
