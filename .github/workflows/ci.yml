@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # 1) 静态检查：不需要 root / docker，任何提交都必须过
+  # ─────────────────────────────────────────────────────────────
+  static:
+    name: 静态检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n 语法检查
+        run: |
+          set -euo pipefail
+          for f in ./*.sh; do
+            printf '%-32s ' "$f"
+            bash -n "$f"
+            echo OK
+          done
+
+      - name: 行尾必须全是 LF（CR=0）
+        # 这个仓库的核心产物是 shell 脚本。被转成 CRLF 传到 Linux 上
+        # 会直接报 bash: $'\r': command not found，而且本地完全看不出来。
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in ./*.sh .gitattributes README.md; do
+            n=$(python3 -c "import sys;print(open(sys.argv[1],'rb').read().count(bytes([13])))" "$f")
+            printf '%-32s CR=%s\n' "$f" "$n"
+            [ "$n" = 0 ] || fail=1
+          done
+          exit $fail
+
+      - name: shellcheck（WARNING 及以上；仅告警，不阻塞）
+        # 刻意不阻塞：这套脚本大量使用 bash 特有写法与故意的非 POSIX 风格，
+        # shellcheck 的意见密度很高但不代表有 bug。先把报告摆出来慢慢清。
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning -e SC2317,SC2154,SC2086 ./*.sh || true
+
+      - name: 脚本头部必须带严格模式
+        # 少了 set -euo pipefail 的脚本，出错的形态完全不一样（错误被静默吞掉），
+        # 属于会一路带到线上才炸的那类。
+        run: |
+          set -euo pipefail
+          for f in ./*.sh; do
+            grep -qE '^set -[A-Za-z]*e' "$f" || { echo "✗ $f 没有 set -e"; exit 1; }
+            echo "✓ $f  $(grep -m1 -E '^set -' "$f")"
+          done
+
+  # ─────────────────────────────────────────────────────────────
+  # 2) 回归套件的**零副作用**分组（A / A2）
+  #    全部用例都走 --dry-run，不落文件、不起容器、不改反代。
+  #    其余分组（B 起）会起真实容器并改真实 Caddyfile，只适合在专用机器上跑，
+  #    不适合放进 CI。
+  # ─────────────────────────────────────────────────────────────
+  regression:
+    name: 回归套件（零副作用 A/A2）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 确认 docker 可用
+        run: |
+          set -euo pipefail
+          docker version
+          docker compose version
+
+      - name: 跑 A / A2 分组
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /root
+          sudo cp install-agent2api.sh /root/install-agent2api.sh
+          sudo env INSTALLER=/root/install-agent2api.sh \
+                   RUN_GROUPS=A,A2 \
+                   TEST_ROOT=/tmp/a2a-regress \
+             bash test-install-agent2api.sh
+
+      - name: 确认测试没有留下任何残留
+        # 零副作用分组的判据不是「用例没报错」，而是**复核到零残留**。
+        run: |
+          set -euo pipefail
+          if docker ps -a --format '{{.Names}}' | grep -E 'reg-|a2a-regress|inst-'; then
+            echo "✗ 测试留下了容器残留"; exit 1
+          fi
+          [ ! -d /tmp/a2a-regress ] || { echo "✗ /tmp/a2a-regress 还在"; exit 1; }
+          echo "✓ 零残留"
+
+  # ─────────────────────────────────────────────────────────────
+  # 3) 冒烟：--help / 参数错误路径必须以人类可读的方式失败
+  # ─────────────────────────────────────────────────────────────
+  smoke:
+    name: 冒烟（错误路径可读性）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 确认 docker 可用
+        # ⚠️ 必须有 docker：部分参数（端口/内存范围）是在 validate_inputs 里才拦的，
+        #   而那已经在 need_root + check_docker 之后了。GitHub runner 自带 docker。
+        run: docker version && docker compose version
+      - name: 缺值 / 非法枚举 / 数值越界都必须说人话
+        # 判据是「以人类可读的方式失败」：rc≠0 **且** 输出里出现预期文案。
+        #   以前缺值时用户看到的是 bash 的 `shift: shift count out of range`。
+        run: |
+          set -uo pipefail
+          fail=0
+          expect_fail() { # expect_fail <应含的文案> <参数...>
+            local want="$1"; shift
+            out=$(sudo bash install-agent2api.sh "$@" 2>&1); rc=$?
+            if [ "$rc" = 0 ]; then echo "✗ 应当失败却成功了：$*"; fail=1; return; fi
+            if ! printf '%s' "$out" | grep -qF "$want"; then
+              echo "✗ $* —— 输出里找不到「$want」"; printf '%s\n' "$out" | tail -6; fail=1; return
+            fi
+            echo "✓ $* → $want"
+          }
+          expect_fail "需要一个值"   --dry-run -y --domain
+          expect_fail "只能"         --dry-run -y --domain x.example.com --expose foo
+          expect_fail "不能同时使用" --dry-run -y --no-domain --domain x.example.com
+          expect_fail "格式"         --dry-run -y --mem 384mb
+          expect_fail "范围"         --dry-run -y --panel-port 99999
+          expect_fail "caddy-mode"   --dry-run -y --caddy-mode bogus
+          exit $fail

@@ -24,9 +24,9 @@
 #
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.7.0"
+SCRIPT_VERSION="1.7.1"
 DEFAULT_IMAGE_REPO="aimodcc/agent2api"
-DEFAULT_TAG="2.7.10"          # 已知可用版本；--tag latest 可跟最新
+DEFAULT_TAG="2.9.1"          # 离线兜底用的「已知可用版本」（只在查不到 Docker Hub 时才用；线上实测 healthy）
 DEFAULT_DIR="/opt/agent2api"
 DEFAULT_CONTAINER="agent2api"
 CADDY_IMAGE="caddy:2-alpine"   # self 模式下自建反代用的镜像
@@ -92,17 +92,26 @@ prune_own_backups() {
     | while IFS= read -r f; do rm -f "$f"; done
 }
 
-on_signal() {
-  if [ "$CADDY_BACKED_UP" = 1 ] && [ -n "$BACKUP_FILE" ] && [ -f "$BACKUP_FILE" ]; then
-    printf '\n' >&2
-    printf '  %s!%s 收到中断信号，正在还原 Caddyfile：%s\n' "$C_YEL" "$C_OFF" "$BACKUP_FILE" >&2
-    cp "$BACKUP_FILE" "$CADDY_FILE" 2>/dev/null || true
-    if caddy_validate >/dev/null 2>&1 && caddy_reload >/dev/null 2>&1; then
-      printf '  %s✓%s 已还原并重载\n' "$C_GRN" "$C_OFF" >&2
-    else
-      printf '  %s×%s 还原后校验/重载未通过，请手工检查 %s\n' "$C_RED" "$C_OFF" "$CADDY_FILE" >&2
-    fi
+# 还原反代配置。只有一个成立时才动手：确实备份过、且还没走到「改动已落地」那步。
+# 正常跑完的路径在 apply_domain 末尾把 CADDY_BACKED_UP 清 0，所以退出时这里直接返回。
+restore_caddy() {
+  [ "$CADDY_BACKED_UP" = 1 ] || return 0
+  [ -n "$BACKUP_FILE" ] && [ -f "$BACKUP_FILE" ] || return 0
+  [ -n "$CADDY_FILE" ] || return 0
+  # 先摘掉陷阱：下面 caddy_validate/caddy_reload 自身可能失败，不能再触发 ERR/EXIT 递归
+  trap - ERR EXIT
+  printf '\n  %s!%s 正在还原 Caddyfile：%s\n' "$C_YEL" "$C_OFF" "$BACKUP_FILE" >&2
+  cp "$BACKUP_FILE" "$CADDY_FILE" 2>/dev/null || return 0
+  if caddy_validate >/dev/null 2>&1 && caddy_reload >/dev/null 2>&1; then
+    printf '  %s✓%s 已还原并重载\n' "$C_GRN" "$C_OFF" >&2
+  else
+    printf '  %s×%s 还原后校验/重载未通过，请手工检查 %s\n' "$C_RED" "$C_OFF" "$CADDY_FILE" >&2
   fi
+  return 0
+}
+
+on_signal() {
+  restore_caddy
   printf '  %s已中止。%s\n' "$C_YEL" "$C_OFF" >&2
   printf '  %s反代配置已还原到你运行前的状态，没有改坏任何东西。%s\n' "$C_DIM" "$C_OFF" >&2
   # 说实话：中断时可能已经起了容器（实测：在下载镜像阶段杀掉，容器已存在但状态文件还没写）。
@@ -112,6 +121,11 @@ on_signal() {
   exit 130
 }
 trap on_signal INT TERM
+# 🔴 原来只接了 INT/TERM。可脚本是 set -Eeuo pipefail —— **任何未处理的失败会直接退出**，
+#   不会走到 on_signal。那种情况下 Caddyfile 可能已经被改过（strip 过了、站点块追加了一半、
+#   磁盘满导致写截断），却没人还原，等到下次 reload/重启才炸 —— 最难排查的那类故障。
+#   ERR + EXIT 同时兜住，并在还原前先摘掉这两个 trap 防止递归。
+trap restore_caddy ERR EXIT
 
 # ── 输出工具 ────────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -218,6 +232,23 @@ choose() {  # choose <提示> <默认序号> <选项...> -> 只把序号打到 s
 # ── 参数解析 ────────────────────────────────────────────────────────────────
 parse_args() {
   while [ $# -gt 0 ]; do
+    # 🔴 下面这一组参数都吃一个值。缺值时原来的 `shift 2` 会越界，
+    #   set -e 直接退出，用户看到的是 bash 的 `shift count out of range`，
+    #   完全不知道是自己漏打了值。提前拦下并说人话。
+    case "$1" in
+      --dir|--tag|--container|--domain|--expose|--panel-port|--gateway-port|--mem|--tz|--caddy-mode)
+        [ $# -ge 2 ] || die "参数 $1 需要一个值（例如：$1 xxx）"
+        # ⚠️ 只在「下一个参数就是本脚本认识的**选项**」时才提示漏写值。
+        #   一开始这里拦的是所有 `-` 开头的值，结果把 `--container -bad`
+        #   （本意是测容器名校验）也抢下来了，报成「看起来像个选项」——
+        #   既误导又破坏了原有行为。非选项的 `-xxx` 值一律放行，
+        #   交给 validate_inputs 去报「容器名非法」这类真正准确的错误。
+        case "${2:-}" in
+          --dir|--tag|--container|--domain|--expose|--panel-port|--gateway-port|--mem|--tz|--caddy-mode|--cf|--no-cf|--open-register|--lock-register|--with-manager|--no-manager|--dry-run|--upgrade|--check-update|--status|--skip-dns-check|--no-deps|--uninstall|--no-domain|--yes|-y|--help|-h)
+            die "参数 $1 需要一个值，但你紧接着写的是 '$2'（那是另一个选项）—— 是不是漏写了 $1 的值？" ;;
+        esac
+        ;;
+    esac
     case "$1" in
       --dir)          INSTALL_DIR="$2"; shift 2 ;;
       --tag)          IMAGE_TAG="$2"; IMAGE_TAG_OVERRIDE="$2"; shift 2 ;;
@@ -507,18 +538,87 @@ check_docker() {
   # ⚠️ 只在"真的要装/升级"时才自动装依赖。
   # 查状态/卸载/查更新时自动装 docker 是反直觉的 —— 用户说"卸载"，脚本却给他装了个 docker
   # 出来（实测踩到：我的测试命令里先跑 --uninstall，结果它把 docker 装回来了）。
-  case "${DO_STATUS}${DO_UNINSTALL}${DO_CHECK_UPDATE}" in
+  # --upgrade 同样属于"只是来看一眼/升一下"，不该顺手给人家装一整套 Docker，故一并挡掉。
+  case "${DO_STATUS}${DO_UNINSTALL}${DO_CHECK_UPDATE}${DO_UPGRADE}" in
     *1*) AUTO_DEPS=0 ;;
   esac
-  ensure_docker         || die "缺少 docker，已中止（未做任何改动）。"
-  ensure_docker_running || die "docker 不可用，已中止（未做任何改动）。"
-  ensure_compose        || die "缺少 docker compose，已中止（未做任何改动）。"
+
+  # 🔴 --dry-run 的承诺是「只打印计划，不实际改动」。原来 dry-run 走的是安装路径，
+  #   AUTO_DEPS 仍是 1 → 机器上缺 docker 时**真的会装上一整套 Docker**，
+  #   装完再打印「dry-run 不做任何改动」—— 自相矛盾，用户以为环境是干净的。
+  #   这里改成：只**检测**、只提示将要做什么，缺了就说明并退出，绝不安装/不启动。
+  if [ "$DRY_RUN" = 1 ]; then
+    if ! command -v docker >/dev/null 2>&1; then
+      warn "[dry-run] 本机没有 docker —— 真跑时会先自动安装并启动它；本次不做任何改动"
+      info "  ${C_DIM}装完 docker 后请重新跑一次 --dry-run，才能看到反代探测结果${C_OFF}"
+      return 1
+    fi
+    if ! docker info >/dev/null 2>&1; then
+      warn "[dry-run] docker 服务未运行 —— 真跑时会尝试启动它；本次不做任何改动"
+      return 1
+    fi
+    if docker compose version >/dev/null 2>&1; then DC=(docker compose)
+    elif command -v docker-compose >/dev/null 2>&1; then DC=(docker-compose)
+    else
+      warn "[dry-run] 缺 docker compose —— 真跑时会自动装；本次不做任何改动"
+      return 1
+    fi
+    ok "[dry-run] docker 已就绪（本次未做任何改动）"
+    return 0
+  fi
+
+  # 本次只是"看 / 升 / 卸"，不需要 docker 来跑服务 —— 缺了就直接说明，**不装、也不启动**。
+  # （单独拎出来是因为 ensure_docker 的提示里带着「自己装的话粘这行」，
+  #   对 --status/--upgrade 这类操作是误导 —— 它会让人以为待会儿真会装。）
+  if [ "$AUTO_DEPS" != 1 ] && ! command -v docker >/dev/null 2>&1; then
+    problem "这台机器上没有 docker，而本次操作不需要它跑服务，所以我没有安装。"
+    info "  本次**没有对系统做任何改动**：没装任何包、没改任何配置、没起任何容器。"
+    info "  要装的话自己敲：curl -fsSL https://get.docker.com | sh"
+    die "已中止。"
+  fi
+
+  # ⚠️ 失败文案要如实：走到这里时 ensure_docker **可能已经装了一部分东西**
+  #   （apt 半途失败、装完二进制但服务起不来等）。说「未做任何改动」是误导——
+  #   用户会以为环境干净，于是什么都不去查。准确的说法是「没改你的配置」。
+  if ! ensure_docker; then
+    problem "docker 没装上（失败原因见上方输出）。"
+    info "  注意：这一步**可能已经在机器上装了一部分东西**（按上面的日志核对）。"
+    info "  但本脚本**没有改动任何配置**：没写 Caddyfile、没起容器、没删任何文件。"
+    die "已中止。"
+  fi
+  if ! ensure_docker_running; then
+    problem "docker 装了但服务起不来。"
+    info "  本脚本没有改动任何配置（没写 Caddyfile、没起容器、没删文件）。"
+    info "  先自己排掉：journalctl -u docker --no-pager -n 20"
+    die "已中止。"
+  fi
+  if ! ensure_compose; then
+    problem "docker compose 装不上。"
+    info "  本脚本没有改动任何配置（没写 Caddyfile、没起容器、没删文件）。"
+    die "已中止。"
+  fi
   ok "docker 已就绪（跑服务要用的容器工具，不用你管）"
 }
 
-# 宿主上所有被占用的端口（监听 + docker 已发布）
+# 十六进制转十进制（纯 awk 实现）。
+# ⚠️ 不能用 gawk 的 strtonum() —— Debian 默认的 mawk 没有这个扩展。
+h2d() {
+  awk 'function h2d(h,  i,c,d,v){v=0;for(i=1;i<=length(h);i++){c=tolower(substr(h,i,1));d=index("0123456789abcdef",c)-1;v=v*16+d}return v}
+       {n=split($2,a,":"); if($4=="0A") print h2d(a[n])}' "$1" 2>/dev/null
+}
+# 宿主上所有被占用的 TCP 监听端口（宿主监听 + docker 已发布）
+# ⚠️ 不能只依赖 ss：精简镜像常常没装 iproute2，而 `ss ... 2>/dev/null` 会把
+#   「命令不存在」和「没有输出」混为一谈 → 返回空 → **所有端口都误判为空闲**。
+#   后果实测过：自建 Caddy 模式一路顺利走到 docker up 才撞 80/443，
+#   随后反复换面板端口也解不开（面板端口不是问题所在）。
+#   这里补一条 /proc/net/tcp{,6} 兜底 —— 内核始终提供，不需要装任何东西。
 used_ports() {
-  { ss -ltnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' ;
+  { if command -v ss >/dev/null 2>&1; then
+      ss -ltnH 2>/dev/null | awk '{print $4}' | sed 's/.*://'
+    else
+      h2d /proc/net/tcp
+      h2d /proc/net/tcp6
+    fi
     docker ps --format '{{.Ports}}' 2>/dev/null | tr ',' '\n' \
       | sed -n 's/.*:\([0-9][0-9]*\)->.*/\1/p' ; } | grep -E '^[0-9]+$' | sort -nu
 }
@@ -556,6 +656,13 @@ detect_web_server() {
   # 2) 宿主进程
   local line
   line=$(ss -ltnp 2>/dev/null | grep -E ':(80|443)\s' | head -1 || true)
+  if ! command -v ss >/dev/null 2>&1; then
+    # 没有 ss 就看不见「是哪个进程占着 80/443」，只能知道有没有被占（靠 used_ports）。
+    # 不说清楚的话，探测结果一律落到 none → 脚本会去自建 Caddy → 抢不到端口。
+    warn "这台机器没装 ss（iproute2），**无法识别已有的反代进程**。"
+    info "${C_DIM}  端口占用仍会检查（走 /proc/net/tcp），但识别不出 Caddy/Nginx。${C_OFF}"
+    info "  想让探测更准：apt install -y iproute2"
+  fi
   if printf '%s' "$line" | grep -qiE 'caddy'; then CADDY_MODE="host"; return 0; fi
   if printf '%s' "$line" | grep -qiE 'nginx'; then
     CADDY_MODE="nginx"; return 0
@@ -607,9 +714,12 @@ host_public_ip() {
 
 # 端口是否空闲（80/443 这类必须独占的端口，起容器前先问清楚）
 check_ports_free() {
-  local p busy=""
+  local p busy="" used
+  # 走 used_ports 而不是直接用 ss：它在没有 ss 时有 /proc/net/tcp 兜底，
+  # 且用 grep -qx 精确匹配，避开了原来 "[:.]${p}$" 把 ${p} 当正则的隐患。
+  used=$(used_ports || true)
   for p in "$@"; do
-    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$"; then busy="${busy} ${p}"; fi
+    if printf '%s\n' "$used" | grep -qx "$p"; then busy="${busy} ${p}"; fi
   done
   if [ -n "$busy" ]; then
     problem "端口${busy} 被别的程序占着 —— 本脚本要腾出 80/443 才能申请 HTTPS 证书"
@@ -719,14 +829,24 @@ caddy_reload() {
 
 # 从 Caddyfile 摘掉本脚本的托管块（靠标记）
 strip_managed_block() {
-  local f="$1" tmp
-  tmp=$(mktemp)
+  local f="$1" tmp staged
+  tmp=$(mktemp) || return 1
+  staged=$(mktemp) || { rm -f "$tmp"; return 1; }
   awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
     $0 == b {skip=1}
     skip != 1 {print}
     $0 == e {skip=0}
   ' "$f" > "$tmp"
-  cat "$tmp" > "$f"
+  # 🔴 原来用 `cat "$tmp" > "$f"` 原地覆盖：保留权限/属主是对的，
+  #   但**不是原子** —— 写到一半断电或被 kill，Caddyfile 就被截断了，
+  #   而本函数自己不备份（apply_domain 的备份在调用前才做，别处不一定有）。
+  #   改成：先 cp 原文件做载体（继承权限/属主），内容写进载体，最后 mv 原子替换。
+  #   中途失败只会留下垃圾临时文件，不会把线上配置改坏。
+  if cp "$f" "$staged" 2>/dev/null && cat "$tmp" > "$staged"; then
+    mv -f "$staged" "$f" || rm -f "$staged"
+  else
+    rm -f "$staged"
+  fi
   rm -f "$tmp"
 }
 
@@ -1040,6 +1160,11 @@ validate_inputs() {
     if ! printf '%s' "$p" | grep -qE '^[0-9]+$'; then
       problem "端口必须是数字：'$p'"; bad=1; continue
     fi
+    # 位数先卡死：下面 `[ "$p" -gt 65535 ]` 碰到超长数字会整数溢出而报错，
+    # 在 set -e 下让脚本在一个莫名其妙的位置退出。5 位 = 最多 99999。
+    if [ "${#p}" -gt 5 ]; then
+      problem "端口超出范围（1-65535）：$p"; bad=1; continue
+    fi
     if [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
       problem "端口超出范围（1-65535）：$p"; bad=1
     fi
@@ -1070,14 +1195,21 @@ validate_inputs() {
     local _n _u _mb
     _n=$(printf '%s' "$MEM_LIMIT" | sed -E 's/^([0-9]+).*/\1/')
     _u=$(printf '%s' "$MEM_LIMIT" | sed -E 's/^[0-9]+([bkmgBKMG]?)$/\1/' | tr 'A-Z' 'a-z')
-    case "$_u" in
-      g) _mb=$((_n * 1024)) ;;
-      m|'') _mb=$_n ;;
-      k) _mb=$((_n / 1024)) ;;
-      b) _mb=0 ;;
-    esac
-    if [ "$_mb" -lt 6 ]; then
-      problem "内存上限太小：'$MEM_LIMIT'（docker 最低 6m；实际使用建议 256m 以上）"; bad=1
+    # 🔴 位数先卡死：下面要算 `$((_n * 1024))`。`--mem 99999999999999g` 能过上面的正则，
+    #   但算术会溢出（bash 报 "value too great for base"），在 set -e 下让脚本
+    #   在一个莫名其妙的位置退出。6 位数 = 最多 999999 GB，够用且不会溢出。
+    if [ "${#_n}" -gt 6 ]; then
+      problem "内存上限的数值过大：'$MEM_LIMIT'（最多 6 位数，即 999999g）"; bad=1
+    else
+      case "$_u" in
+        g) _mb=$((_n * 1024)) ;;
+        m|'') _mb=$_n ;;
+        k) _mb=$((_n / 1024)) ;;
+        b) _mb=0 ;;
+      esac
+      if [ "$_mb" -lt 6 ]; then
+        problem "内存上限太小：'$MEM_LIMIT'（docker 最低 6m；实际使用建议 256m 以上）"; bad=1
+      fi
     fi
   fi
 
@@ -1136,6 +1268,23 @@ networks:
     external: true
 "
       else
+        # 🔴 取不到共享网络时**不能**静默回落到 loopback。
+        #   容器里的反代够不到宿主的 127.0.0.1，于是生成的 Caddyfile 语法正确、
+        #   validate 通过、reload 也成功 —— 但一访问就是 502。更糟的是旧版
+        #   verify_tls 会把 502 报成「证书尚未就绪」，把人引向 DNS / 安全组，
+        #   三个方向一个都不对（实测踩过）。
+        #   正确做法只有两条：同网络走容器名，或宿主侧服务改绑 docker 网桥网关
+        #   （线上实测就是 172.19.0.1，不是 127.0.0.1）。
+        #   这里没有域名、不写站点块时无所谓；有域名就必须问清楚。
+        if [ -n "$DOMAIN" ]; then
+          problem "反代容器 ${CADDY_CONTAINER} 上没取到 docker 网络，无法确定反代方式。"
+          info "  容器里的反代够不到宿主 127.0.0.1。若按 127.0.0.1 生成配置，"
+          info "  Caddyfile 会校验通过、reload 也成功，但一访问就是 502。"
+          info "  先查清楚它到底在哪个网络："
+          info "    docker inspect ${CADDY_CONTAINER} | grep -A3 NetworkSettings"
+          info "  确认网络名后，可加 --caddy-mode docker 强制走容器名反代。"
+          die "已中止（未做任何改动）。"
+        fi
         UPSTREAM_STYLE="loopback"
       fi ;;
     self)
@@ -1466,26 +1615,43 @@ apply_domain() {
 }
 
 verify_tls() {
-  local i code
+  local i tls="" code
   info "等待证书签发（最长 60 秒）…"
+
+  # 🔴 必须把「证书没签出来」与「后端连不上」**分开判**。
+  # 原来只看 HTTP 状态码是不是 2xx/3xx，而反代拿不到后端返回的是 502 →
+  # 不匹配 → 统一报成「证书尚未就绪」，并把用户指向 DNS / 安全组 / 解析传播。
+  # 那三个方向**一个都不对**（实测踩过：后端容器根本没在监听）。
+  # 所以先单独验 TLS 握手：能拿到 X509 才说明证书链路通了。
   for i in $(seq 1 20); do
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
-            --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/" 2>/dev/null || echo "000")
-    case "$code" in
-      2*|3*) ok "HTTPS 就绪（HTTP $code）"; break ;;
-      *)     code="000" ;;
-    esac
+    tls=$(echo | timeout 8 openssl s_client -connect 127.0.0.1:443 -servername "$DOMAIN" 2>/dev/null \
+          | openssl x509 -noout -enddate 2>/dev/null | sed 's/^notAfter=//')
+    [ -n "$tls" ] && break
     sleep 3
   done
+  if [ -z "$tls" ]; then
+    problem "TLS 握手拿不到证书 —— 这一步确实还没通"
+    info "  · 域名没解析到本机（Let's Encrypt 需从公网访问 80/443）"
+    info "  · 云安全组 / 防火墙没放通 80、443"
+    info "  · 80/443 上跑的不是本脚本配置的 Caddy"
+    info "  · 证书还在签发中：docker logs ${CADDY_CONTAINER:-${CADDY_SELF_CONTAINER:-<caddy>}} 2>&1 | tail -20"
+    return 1
+  fi
+  ok "证书已签发（到期：$tls）"
+
+  # 证书已确认，再看 HTTP：此时的失败一定是应用层，不会再误报成证书问题
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+          --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/" 2>/dev/null || echo 000)
   case "$code" in
-    2*|3*) ;;
-    *)
-      warn "证书尚未就绪（最后状态 $code）。常见原因："
-      info "  · 域名没解析到本机（Let's Encrypt 需从公网访问 80/443）"
-      info "  · 云安全组 / 防火墙没放通 80、443"
-      info "  · 域名刚改解析，还在传播"
-      info "  稍后自查：docker logs <caddy容器> 或 journalctl -u caddy | tail -20"
+    2*|3*) ok "HTTPS 就绪（HTTP $code）" ;;
+    502|504)
+      problem "反代拿不到后端（HTTP $code）—— 证书是好的，问题在容器网络"
+      info "  · 反代在**容器**里时够不到宿主的 127.0.0.1，必须同网络走容器名，"
+      info "    或宿主侧服务改绑 docker 网桥网关（如 172.19.0.1）而不是 127.0.0.1"
+      info "  · 查反代所在网络：docker inspect -f '{{range \$k,\$v := .NetworkSettings.Networks}}{{\$k}}{{\"\n\"}}{{end}}' ${CADDY_CONTAINER:-<caddy容器>}"
+      info "  · 查后端在不在：docker logs ${CONTAINER} --tail 20"
       return 1 ;;
+    *)  problem "HTTPS 返回 $code（证书正常，是应用层异常）" ;;
   esac
 
   # 顺带验一下 /v1 网关路径 —— 端口没接对时这里会 502，早发现比用户报障好
@@ -1520,7 +1686,7 @@ integrate_manager() {
   pw=$(docker inspect "$cname" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^WB_ADMIN_PASSWORD=//p')
   user="${user:-admin}"
   if [ -z "$pw" ]; then
-    warn "容器里没有 WB_ADMIN_PASSWORD，无法自动登录。"
+    warn "容器里没有 WB_ADMIN_PASSWORD —— 面板用的是首次启动时随机生成的密码，自动登记跳过。"
     info "请到 manager 面板「设置 → 上游」手动新增："
     info "  地址 http://${CONTAINER}:${GW_PORT}    密钥 = 面板里创建的网关 Key"
     return 0
@@ -1542,9 +1708,18 @@ integrate_manager() {
 
   if [ "$DRY_RUN" = 1 ]; then info "[dry-run] 将调用 ${url_base}/api/upstreams 登记上游"; return 0; fi
 
+  # 🔴 登录失败必须**明确区分**「密码不对」和「其它问题」。
+  #   WB_ADMIN_PASSWORD 只是 workbuddy-manager **首次启动**时的初始值；
+  #   用户后来在面板里改过密码后，环境变量里那份就成了旧密码（源码 security.py:135
+  #   只在首次启动时用它建用户，之后以 users.json 的 pwd_hash 为准）。
+  #   而该项目的登录失败计数是 IP + **用户名**双维度，阈值 5 次 / 锁定 10 分钟
+  #   （security.py: MAX_FAILS=5、LOCK_SECONDS=600）。也就是说
+  #   **每重跑一次本脚本就记一次失败，5 次后连管理员本人都被锁在外面。**
+  #   所以这里绝不能让用户以为「再跑一次就好了」。
+  local rc=0
   MGR_BASE="$url_base" MGR_USER="$user" MGR_PW="$pw" MGR_KEY="$a2akey" \
   MGR_UP_URL="http://${CONTAINER}:${GW_PORT}" MGR_UP_NAME="${CONTAINER}(Qoder)" \
-  python3 - <<'PY' || warn "manager 登记未完成，请到面板手动新增上游"
+  python3 - <<'PY' || rc=$?
 import os, json, urllib.request, urllib.error, http.cookiejar
 base=os.environ["MGR_BASE"]
 cj=http.cookiejar.CookieJar()
@@ -1558,13 +1733,16 @@ def call(path, data=None):
         return r.status, (json.loads(t) if t.strip().startswith(("{","[")) else t)
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode()[:200]
-st,_=call("/api/login", {"username":os.environ["MGR_USER"], "password":os.environ["MGR_PW"]})
+    except Exception as e:
+        return 0, str(e)[:200]
+st,body=call("/api/login", {"username":os.environ["MGR_USER"], "password":os.environ["MGR_PW"]})
 if st!=200:
-    print("  登录失败（%s），跳过" % st); raise SystemExit(1)
+    print("  manager 登录未成功（HTTP %s）%s" % (st, ("：" + str(body)[:120]) if st not in (401,) else "：用户名或密码错误"))
+    raise SystemExit(2 if st in (401,403,429) else 1)
 print("  已登录 manager")
 st,up=call("/api/upstreams")
 if st!=200:
-    print("  读取上游失败（%s）" % st); raise SystemExit(1)
+    print("  读取上游列表失败（HTTP %s）" % st); raise SystemExit(1)
 target=os.environ["MGR_UP_URL"]
 if any(u.get("base_url")==target for u in (up.get("items") or [])):
     print("  上游已存在，无需重复添加")
@@ -1572,8 +1750,28 @@ else:
     st,res=call("/api/upstreams", {"name":os.environ["MGR_UP_NAME"], "base_url":target,
         "api_key":os.environ["MGR_KEY"], "note":"由 install-agent2api.sh 自动登记",
         "enabled":True, "auth_dir":"", "container":os.environ.get("MGR_UP_CONTAINER","")})
-    print("  新增上游：%s" % ("成功" if st in (200,201) else "失败 %s %s" % (st,res)))
+    if st in (200,201):
+        print("  新增上游：成功")
+    else:
+        print("  新增上游失败（HTTP %s）：%s" % (st, res)); raise SystemExit(1)
 PY
+
+  if [ "$rc" = 2 ]; then
+    problem "manager 自动登记已跳过 —— 登录被拒。"
+    info "  最可能的原因：WB_ADMIN_PASSWORD 是面板**首次启动**时的初始值；"
+    info "  如果你后来在面板里改过密码，它就已经过期了。"
+    info "  ⚠️ 该项目有登录锁定（同一用户名失败 5 次即锁 10 分钟），"
+    info "     请**不要反复重跑本脚本**去试密码。"
+    info "  两条出路："
+    info "    ① 到 manager 面板「设置」里重设密码，或确认环境变量与面板密码一致"
+    info "    ② 重跑时加 --no-manager 跳过自动登记，再到面板「设置 → 上游」手工新增"
+    info "        地址 http://${CONTAINER}:${GW_PORT}（不带 /v1）"
+    info "        密钥 = agent2api 面板「网关 Key」里那把"
+  elif [ "$rc" != 0 ]; then
+    warn "manager 登记未完成（HTTP/网络层问题，不是密码问题）"
+    info "  请到面板「设置 → 上游」手动新增："
+    info "    地址 http://${CONTAINER}:${GW_PORT}（不带 /v1）"
+  fi
 }
 
 # 给 Nginx / 其他反代用户一份可直接粘贴的配置。
@@ -1837,15 +2035,48 @@ do_uninstall() {
   fi
 
   if [ -d "$INSTALL_DIR" ]; then
-    if ask_yn "删除目录 $INSTALL_DIR（含数据卷 data/，不可恢复）？" "n"; then
-      run rm -rf "$INSTALL_DIR"; ok "已删除 $INSTALL_DIR"
-    else
-      info "目录保留：$INSTALL_DIR"
-    fi
+    # 🔴 白名单：拒绝删顶层目录。
+    #   INSTALL_DIR 来自 --dir/状态文件，validate_inputs 只查了空格与绝对路径；
+    #   而这里要跑的是 rm -rf。`--dir /opt` 一次确认就能把整棵 /opt 端掉 ——
+    #   而真实部署往往就在 /opt 下面。确认框挡得住「手快」，挡不住「我就是想删它」。
+    case "$INSTALL_DIR" in
+      /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+        problem "拒绝删除顶层目录：$INSTALL_DIR"
+        info "${C_DIM}  脚本只该删自己的安装子目录（默认 /opt/agent2api）。${C_OFF}"
+        info "目录保留：$INSTALL_DIR"
+        ;;
+      *)
+        if ask_yn "删除目录 $INSTALL_DIR（含数据卷 data/，不可恢复）？" "n"; then
+          run rm -rf "$INSTALL_DIR"; ok "已删除 $INSTALL_DIR"
+        else
+          info "目录保留：$INSTALL_DIR"
+        fi ;;
+    esac
   fi
   local img="${DEFAULT_IMAGE_REPO}:${IMAGE_TAG:-$DEFAULT_TAG}"
   info "镜像 ${img} 保留未删（需要时：docker rmi ${img}）"
   ok "卸载完成"
+}
+
+# 供应链可核对性：把「现在跑的到底是哪个镜像、内容摘要是什么」明确打出来。
+# 只打印 tag 是不够的 —— **tag 是可变的**，同一个 tag 随时可以被重新推成另一个镜像，
+# 用户只看到 "2.9.1" 无从发现。digest 才是不可变的内容地址。
+print_image_provenance() {
+  local img id
+  img="${DEFAULT_IMAGE_REPO}:${IMAGE_TAG}"
+  id=$(docker inspect "$CONTAINER" --format '{{.Image}}' 2>/dev/null || true)
+  if [ -n "$id" ]; then
+    ok "镜像：$img"
+    info "${C_DIM}  内容摘要 sha256:${id}（不可变；核对可用 docker inspect --format '{{.Image}}' ${CONTAINER}）${C_OFF}"
+  else
+    warn "读不到镜像摘要（容器可能还没起来）。"
+  fi
+  case "$IMAGE_TAG" in
+    latest|main|master|"")
+      problem "你在用可变 tag（${IMAGE_TAG:-空}）—— 它随时可能被重新指向另一个镜像。"
+      info "  生产环境请锁定具体版本号，或用 --tag 指定；改完记得同步更新 install.conf。"
+      ;;
+  esac
 }
 
 # ── 汇总 ────────────────────────────────────────────────────────────────────
@@ -1861,6 +2092,7 @@ summary() {
   if [ -n "$DOMAIN" ]; then panel_url="https://${DOMAIN}/"; else panel_url="http://127.0.0.1:${PANEL_PORT}/"; fi
 
   title "装好了！"
+  print_image_provenance
 
   # ══════════ 新手只需要看这一段：一个明确的下一个动作 ══════════
   printf '\n'

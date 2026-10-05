@@ -14,6 +14,11 @@
 #   INSTALLER=/path/to/install-agent2api.sh bash test-install-agent2api.sh
 #   KEEP=1 ...    # 保留现场，便于失败后排查
 #
+#   RUN_GROUPS=A,A2  # 只跑指定分组（默认 all）。CI 用它跑**零副作用**的那几组：
+#                 #   A   参数校验 —— 全部 --dry-run，不落任何文件
+#                 #   A2  边界与异常 —— 同上
+#                 # 其余分组会起真实容器、改真实反代，只适合在专用机器上跑。
+#
 # 退出码 = 失败用例数（0 = 全过）
 #
 set -uo pipefail      # 刻意不用 -e：单个用例失败要继续跑完
@@ -23,8 +28,20 @@ TEST_ROOT="${TEST_ROOT:-/opt/a2a-regress}"
 TEST_DOMAIN="${TEST_DOMAIN:-}"
 EXISTING_DOMAINS="${EXISTING_DOMAINS:-}"     # 空格分隔，用于复检「原有站点未被影响」
 KEEP="${KEEP:-0}"
+# ⚠️ 变量名**不能叫 GROUPS** —— 那是 bash 的只读内建数组（当前用户的组 ID 列表）。
+#    给它赋值会被静默忽略，`${GROUPS:-all}` 取到的是 gid 0，
+#    于是「一个组都匹配不上」→ 一个用例都不跑 → 输出「通过 0 失败 0」而退出码仍是 0。
+#    实测踩过：CI 一片绿，实际上一条都没测。所以叫 RUN_GROUPS。
+RUN_GROUPS="${RUN_GROUPS:-all}"
 P_PORT="${P_PORT:-3210}"                     # 面板端口基准
 G_PORT="${G_PORT:-3211}"                     # 网关端口基准
+
+# 分组开关：RUN_GROUPS 里含 all 就全跑；否则只跑列出的分组
+want() {
+  case ",${RUN_GROUPS}," in *,all,*) return 0 ;; esac
+  case ",${RUN_GROUPS}," in *,"$1",*) return 0 ;; esac
+  return 1
+}
 
 PASS=0; FAIL=0; SKIP=0; FAILED=()
 
@@ -68,6 +85,14 @@ preflight() {
   printf '%s=== install-agent2api.sh 回归套件 ===%s\n' "$FG_B" "$FG_O"
   if [ "$(id -u)" != 0 ]; then printf '需要 root 运行\n' >&2; exit 2; fi
   if [ ! -f "$INSTALLER" ]; then printf '找不到安装脚本：%s\n' "$INSTALLER" >&2; exit 2; fi
+  # 🔴 被测脚本没有 +x 时，每个用例都会以 rc=126（无法执行）失败。
+  #   危险的是：那些「只断言 rc≠0」的用例在这种失败下反而**假通过** ——
+  #   实测踩过：一次 15 个用例全 rc=126，其中 3 个显示 ✓，退出码却是 15。
+  #   所以这里把执行权限补上，并在补不上时直接中止，别让环境问题混进用例结果。
+  chmod +x "$INSTALLER" 2>/dev/null || true
+  if [ ! -x "$INSTALLER" ]; then
+    printf '被测脚本没有执行权限且无法 chmod：%s\n' "$INSTALLER" >&2; exit 2
+  fi
   bash -n "$INSTALLER" || { printf '安装脚本语法不通过\n' >&2; exit 2; }
   note "被测脚本：$INSTALLER"
   note "用例目录：$TEST_ROOT"
@@ -160,11 +185,11 @@ case_conflict_no_domain_and_domain() {
 case_mem_too_small() {
   begin "--mem 0m / 1k 被拦下（低于 docker 的 6m 下限）"
   run_installer --dry-run -y --dir "$(inst bm)" --mem 0m
-  local r1=$RC
+  local r1=$RC o1="$OUT"
   run_installer --dry-run -y --dir "$(inst bm)" --mem 1k
-  local r2=$RC
-  { [ "$r1" != 0 ] && [ "$r2" != 0 ]; }
-  verdict $? "0m→rc=$r1  1k→rc=$r2"
+  { [ "$r1" != 0 ] && [ "$RC" != 0 ] \
+    && printf '%s' "$o1" | grep -qF "太小" && printf '%s' "$OUT" | grep -qF "太小"; }
+  verdict $? "0m→rc=$r1  1k→rc=$RC"
 }
 case_bad_caddy_mode() {
   begin "--caddy-mode 非法值被拦下（以前会被静默忽略）"
@@ -324,7 +349,7 @@ case_menu_upgrade() {
 }
 
 case_no_deps_flag() {
-  begin "--no-deps：缺 docker 时只给命令、不擅自装（保护用户系统）"
+  begin "--no-deps + --dry-run：缺 docker 时只检测、不安装、不起服务"
   # 用 PATH 把 docker 藏起来，模拟"机器上没有 docker"
   local fake; fake="$(mktemp -d)"
   local i
@@ -335,11 +360,65 @@ case_no_deps_flag() {
   local out rc
   out=$(env PATH="$fake" "$INSTALLER" --dry-run --yes --no-deps --dir "$(inst nd)" 2>&1); rc=$?
   rm -rf "$fake"
-  local told=0 notinst=0
-  printf '%s' "$out" | grep -qF "get.docker.com" && told=1
-  printf '%s' "$out" | grep -qF "自动帮你装" && notinst=1
-  { [ "$rc" != 0 ] && [ "$told" = 1 ] && [ "$notinst" = 1 ]; }
-  verdict $? "rc=$rc 给了命令=$told 提示可自动装=$notinst"
+  local said=0 installing=0
+  printf '%s' "$out" | grep -qF "本次不做任何改动" && said=1
+  # 🔴 关键断言：dry-run 里出现任何「正在装」的迹象都算失败。
+  #   这条直接钉住 v1.7.1 修的那个问题 —— 原来 --dry-run 走的是安装路径，
+  #   机器上没 docker 时**真的会装上一整套 Docker**，装完还打印「不实际改动」。
+  #   注意：提示里出现 get.docker.com 是**给人建议**，不等于真的去装了，不算违规。
+  printf '%s' "$out" | grep -qE "我来装|方式 [0-9]/4|正在安装|先装个下载工具|apt purge" && installing=1
+  { [ "$rc" != 0 ] && [ "$said" = 1 ] && [ "$installing" = 0 ]; }
+  verdict $? "rc=$rc 明说未改动=$said 出现安装迹象=$installing"
+}
+
+case_upgrade_no_autodeps() {
+  begin "--upgrade 缺 docker 时**不**擅自安装（只看/升，不动系统）"
+  # 与 --status/--uninstall 同理：用户跑 --upgrade 不是请你去装一整套 Docker。
+  # v1.7.0 的 AUTO_DEPS 白名单漏了 DO_UPGRADE，这里钉住。
+  local fake; fake="$(mktemp -d)"
+  local i
+  for i in /usr/bin/* /bin/* /usr/local/bin/*; do
+    b=$(basename "$i"); [ "$b" = "docker" ] && continue
+    ln -sf "$i" "$fake/$b" 2>/dev/null
+  done
+  local out rc installing=0 said=0
+  out=$(env PATH="$fake" "$INSTALLER" --upgrade --yes --dir "$(inst nu)" 2>&1); rc=$?
+  rm -rf "$fake"
+  # 同上：判断「有没有真的动手装」，而不是「有没有提到 get.docker.com」
+  printf '%s' "$out" | grep -qE "我来装|方式 [0-9]/4|正在安装|先装个下载工具|apt purge" && installing=1
+  printf '%s' "$out" | grep -qF "没有对系统做任何改动" && said=1
+  # 必须同时断 rc≠0 和「说了没做」—— 只断 rc≠0 的话，
+  # 环境问题（脚本没有 +x → rc=126）也会被当成通过。
+  { [ "$rc" != 0 ] && [ "$installing" = 0 ] && [ "$said" = 1 ]; }
+  verdict $? "rc=$rc 擅自安装迹象=$installing 明说未改动=$said"
+}
+
+case_arg_missing_value() {
+  begin "参数缺值时给人话，而不是 bash 的 shift 越界报错"
+  run_installer --dry-run -y --domain
+  local r1=$RC o1="$OUT"
+  run_installer --dry-run -y --mem
+  { [ "$r1" != 0 ] && [ "$RC" != 0 ] \
+    && printf '%s' "$o1" | grep -qF "需要一个值" \
+    && printf '%s' "$OUT" | grep -qF "需要一个值"; }
+  verdict $? "rc=$r1/$RC"
+}
+
+case_huge_numbers() {
+  begin "超长数字（端口/内存）被拦下，不会触发算术溢出"
+  run_installer --dry-run -y --dir "$(inst hn)" --panel-port 99999999999999999999
+  local r1=$RC o1="$OUT"
+  run_installer --dry-run -y --dir "$(inst hn)" --mem 99999999999999g
+  # 三重断言：rc≠0 + 说的是人话 + bash 没有吐 "value too great for base"
+  # ⚠️ 「没有溢出」这一条要用 if 写，不能写成 `! a | grep` ——
+  #   `!` 的优先级高于管道，那样解析成 `(!a) | grep`，恒为假（实测踩过）。
+  overflow=0
+  if printf '%s' "$o1$OUT" | grep -qi "value too great"; then overflow=1; fi
+  { [ "$r1" != 0 ] && [ "$RC" != 0 ] \
+    && printf '%s' "$o1" | grep -qF "范围" \
+    && printf '%s' "$OUT" | grep -qF "过大" \
+    && [ "$overflow" = 0 ]; }
+  verdict $? "端口rc=$r1 内存rc=$RC 溢出迹象=$overflow"
 }
 
 # ── C. 端口冲突与自动避让 ───────────────────────────────────────────────────
@@ -481,51 +560,70 @@ case_existing_sites() {
 # ── 主流程 ──────────────────────────────────────────────────────────────────
 preflight
 
-printf '\n%s[A] 参数校验%s\n' "$FG_B" "$FG_O"
-case_help; case_unknown_arg; case_bad_port_alpha; case_bad_port_range
-case_same_ports; case_bad_expose; case_bad_mem; case_bad_container
-case_rel_dir; case_dryrun_no_side_effect
-
-printf '
-%s[A2] 边界与异常（防退化）%s
-' "$FG_B" "$FG_O"
-case_bad_expose_no_domain; case_conflict_no_domain_and_domain
-case_no_deps_flag
-case_mem_too_small; case_bad_caddy_mode
-
-printf '\n%s[B] 默认值路径与幂等%s\n' "$FG_B" "$FG_O"
-case_install_nodomain; case_rerun_idempotent; case_domains_absent_without_flag; case_corrupt_state_file
-
-printf '\n%s[B2] 状态与版本管理%s\n' "$FG_B" "$FG_O"
-case_status; case_check_update; case_upgrade_same; case_upgrade_rollback
-
-printf '
-%s[B3] 重跑菜单（交互路径）%s
-' "$FG_B" "$FG_O"
-case_menu_uninstall; case_menu_upgrade
-
-printf '\n%s[C] 端口与容器名冲突%s\n' "$FG_B" "$FG_O"
-case_port_conflict_auto; case_container_name_conflict
-
-printf '\n%s[D] 域名与 TLS%s\n' "$FG_B" "$FG_O"
-if domain_ready; then
-  note "TEST_DOMAIN=$TEST_DOMAIN 已解析到本机，执行域名用例"
-  case_domain_install; case_lock_register; case_domain_marker_once; case_domain_prefill
-  case_domain_conflict_fastfail; case_no_domain_removes_block
-else
-  for n in "域名安装" "注册开关（--lock-register/--open-register）" "托管块幂等" "状态复用" "域名冲突 fail-fast" "--no-domain 摘除"; do
-    begin "$n"; skip "需要 TEST_DOMAIN 且必须解析到本机公网 IP"
-  done
+if want A; then
+  printf '\n%s[A] 参数校验%s\n' "$FG_B" "$FG_O"
+  case_help; case_unknown_arg; case_bad_port_alpha; case_bad_port_range
+  case_same_ports; case_bad_expose; case_bad_mem; case_bad_container
+  case_rel_dir; case_dryrun_no_side_effect
 fi
 
-printf '\n%s[D2] 流式（SSE 是否被缓冲）%s\n' "$FG_B" "$FG_O"
-case_streaming
+if want A2; then
+  printf '
+  %s[A2] 边界与异常（防退化）%s
+  ' "$FG_B" "$FG_O"
+  case_bad_expose_no_domain; case_conflict_no_domain_and_domain
+  case_no_deps_flag; case_upgrade_no_autodeps
+  case_arg_missing_value; case_huge_numbers
+  case_mem_too_small; case_bad_caddy_mode
+fi
 
-printf '\n%s[E] 卸载%s\n' "$FG_B" "$FG_O"
-case_uninstall; case_uninstall_without_state
+if want default; then
+  printf '\n%s[B] 默认值路径与幂等%s\n' "$FG_B" "$FG_O"
+  case_install_nodomain; case_rerun_idempotent; case_domains_absent_without_flag; case_corrupt_state_file
+fi
 
-printf '\n%s[F] 回检%s\n' "$FG_B" "$FG_O"
-case_existing_sites
+if want state; then
+  printf '\n%s[B2] 状态与版本管理%s\n' "$FG_B" "$FG_O"
+  case_status; case_check_update; case_upgrade_same; case_upgrade_rollback
+
+  printf '
+  %s[B3] 重跑菜单（交互路径）%s
+  ' "$FG_B" "$FG_O"
+  case_menu_uninstall; case_menu_upgrade
+fi
+
+if want conflict; then
+  printf '\n%s[C] 端口与容器名冲突%s\n' "$FG_B" "$FG_O"
+  case_port_conflict_auto; case_container_name_conflict
+fi
+
+if want domain; then
+  printf '\n%s[D] 域名与 TLS%s\n' "$FG_B" "$FG_O"
+  if domain_ready; then
+    note "TEST_DOMAIN=$TEST_DOMAIN 已解析到本机，执行域名用例"
+    case_domain_install; case_lock_register; case_domain_marker_once; case_domain_prefill
+    case_domain_conflict_fastfail; case_no_domain_removes_block
+  else
+    for n in "域名安装" "注册开关（--lock-register/--open-register）" "托管块幂等" "状态复用" "域名冲突 fail-fast" "--no-domain 摘除"; do
+      begin "$n"; skip "需要 TEST_DOMAIN 且必须解析到本机公网 IP"
+    done
+  fi
+fi
+
+if want stream; then
+  printf '\n%s[D2] 流式（SSE 是否被缓冲）%s\n' "$FG_B" "$FG_O"
+  case_streaming
+fi
+
+if want uninstall; then
+  printf '\n%s[E] 卸载%s\n' "$FG_B" "$FG_O"
+  case_uninstall; case_uninstall_without_state
+fi
+
+if want recheck; then
+  printf '\n%s[F] 回检%s\n' "$FG_B" "$FG_O"
+  case_existing_sites
+fi
 
 # 兜底清理
 cleanup_instance "$D" "$C"
@@ -534,6 +632,22 @@ cleanup_instance "$DD" "$DC"
 printf '\n%s=== 结果 ===%s\n' "$FG_B" "$FG_O"
 printf '  通过 %s%d%s   失败 %s%d%s   跳过 %s%d%s\n' \
   "$FG_G" "$PASS" "$FG_O" "$FG_R" "$FAIL" "$FG_O" "$FG_D" "$SKIP" "$FG_O"
+
+# 🔴 「一个用例都没执行」绝不能算通过。
+#   实测踩过（两个 bug 叠在一起，只跑一次真机才发现）：
+#     ① 文档写 GROUPS=A,A2，代码里判的是 `want args` —— 组名对不上，整块被跳过；
+#     ② 更隐蔽：变量名本来叫 GROUPS，而 **GROUPS 是 bash 的只读内建数组**
+#        （当前用户的组 ID），赋值被静默忽略，`${GROUPS:-all}` 取到的是 gid 0。
+#   两者叠加的结果是「通过 0 失败 0 跳过 0」、退出码 0、CI 一片绿，
+#   实际上一条都没测。这种假绿比红灯危险得多。
+if [ $((PASS + FAIL)) -eq 0 ]; then
+  printf '  %s× 本次没有任何用例被执行%s\n' "$FG_R" "$FG_O"
+  printf '    RUN_GROUPS=%s 与实际组名不符。可用组名：\n' "$RUN_GROUPS"
+  printf '    A A2 B B2 B3 C D stream uninstall recheck（默认 all）\n'
+  FAIL=$((FAIL + 1))
+  FAILED+=("（零执行：RUN_GROUPS 拼写有误？）")
+fi
+
 if [ "$FAIL" -gt 0 ]; then
   printf '  失败用例：\n'
   for f in "${FAILED[@]}"; do printf '    · %s\n' "$f"; done

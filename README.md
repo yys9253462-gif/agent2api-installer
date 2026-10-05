@@ -4,13 +4,25 @@
 一条命令完成：拉镜像 → 起容器 → 可选绑域名并**自动申请 Let's Encrypt 证书** → 接好反向代理。
 
 - **单文件**：`install-agent2api.sh`，除 docker 外无依赖
-- **版本**：v1.1.0
-- **配套回归套件**：`test-install-agent2api.sh`（37 个用例，一条命令跑完）
+- **版本**：v1.7.1
+- **配套回归套件**：`test-install-agent2api.sh`（40 个用例，一条命令跑完）
+- **CI**：静态检查 + 零副作用回归 + 错误路径可读性，每次 push 自动跑
+  [![CI](https://github.com/yys9253462-gif/agent2api-installer/actions/workflows/ci.yml/badge.svg)](https://github.com/yys9253462-gif/agent2api-installer/actions/workflows/ci.yml)
 - **测试状态**：已在 Debian 12 + Docker 29.8.1 上端到端实测通过（含真实域名签证书、SSE 流式、升级回滚、卸载）
 
 > ⚠️ **免责声明**：本仓库是**非官方**的第三方部署脚本，与 agent2api 上游项目及作者无任何关联，
 > 也未获其背书。上游项目迭代很快，脚本按当前版本的接口行为编写，上游若改动接口可能需要相应调整。
 > 使用前请自行评估。本仓库**未附许可证**，默认保留全部权利。
+
+> 🔐 **供应链说明（请读这段）**
+>
+> 1. 脚本默认拉取 Docker Hub 上 **第三方账号 `aimodcc/agent2api`** 的镜像，并**以 root 权限运行**它。
+>    任何对该镜像有 push 权限的人，都能改变你机器上跑的程序。
+> 2. **tag 是可变的**：默认行为是去 Docker Hub 查「最新版」并直接使用。生产环境建议用
+>    `--tag <具体版本号>` 锁死；装完脚本会打印镜像的**内容摘要 sha256**，可用于事后核对。
+> 3. `deploy.sh` 会依次尝试 3 个源，其中**第一个是网盘静态副本**。它会做三级校验：
+>    shebang → 是否含 `SCRIPT_VERSION` → （可选）SHA256 比对。
+>    想强制校验，见下面的「核对安装器完整性」。
 
 ---
 
@@ -25,6 +37,18 @@ curl -fsSLO https://raw.githubusercontent.com/yys9253462-gif/agent2api-installer
 ```
 
 国内访问 GitHub 不稳，也可以走网盘（永久取件码 **20818**）：<https://pan.ailxw.com/pickup/20818>
+
+### 核对安装器完整性
+
+```bash
+# 1) 看摘要，与本页底部「本版校验值」对照
+curl -fsSLO https://raw.githubusercontent.com/yys9253462-gif/agent2api-installer/main/install-agent2api.sh
+sha256sum install-agent2api.sh
+
+# 2) 用引导脚本安装时强制校验（不符就中止，不执行）
+EXPECT_SHA256=<上面算出的 64 位摘要> \
+  curl -fsSL https://cdn.jsdelivr.net/gh/yys9253462-gif/agent2api-installer@main/deploy.sh | sudo EXPECT_SHA256=<摘要> bash
+```
 
 图文教程（含逐项参数、实测记录与踩坑）：<https://isoziyuan.com/p/100171/>
 
@@ -46,7 +70,7 @@ curl -fsSLO https://raw.githubusercontent.com/yys9253462-gif/agent2api-installer
 | **集成** | `--with-manager` 登记为 workbuddy-manager 上游，网关 Key **自动从本机库读取**（免粘贴） |
 | **Nginx 用户** | 不自动改 Nginx，但打印**可直接粘贴**的 server 块 + certbot 命令（含 `proxy_buffering off`） |
 
-**自动化回归套件**：`test-install-agent2api.sh`，**37 个用例**，一条命令跑完。
+**自动化回归套件**：`test-install-agent2api.sh`，**40 个用例**，一条命令跑完。
 
 ---
 
@@ -446,7 +470,7 @@ ssh -N -L 3066:127.0.0.1:3066 -L 3065:127.0.0.1:3065 root@<服务器IP>
 | **回归套件（带域名）** | **23 通过 / 0 失败 / 0 跳过** |
 | 套件自身清理 | 无残留容器/目录/配置块；生产站 rdwb.example.net 全程 200 |
 
-**回归套件** `test-install-agent2api.sh` 把这 37 个用例固化成一条命令，改完脚本直接跑。
+**回归套件** `test-install-agent2api.sh` 把这 40 个用例固化成一条命令，改完脚本直接跑。
 
 ---
 
@@ -576,8 +600,14 @@ ssh -N -L 3066:127.0.0.1:3066 -L 3065:127.0.0.1:3065 root@<服务器IP>
 
 - 只写 **Caddy** 配置；Nginx 用户需自行反代（脚本会把后端地址告诉你）。
 - workbuddy-manager 集成需要该容器里存在 `WB_ADMIN_PASSWORD`（否则提示你手动在面板加）。
+  ⚠️ 它只是面板**首次启动**时的初始值；你后来在面板里改过密码，它就过期了。
+  自动登记失败时脚本会明确提示，且**不会诱导你反复重跑** —— 该项目同一用户名登录失败
+  5 次即锁 10 分钟，重跑只会把自己锁在外面。
 - 镜像 tag 默认取 Docker Hub 最新版；网络不通时回落到内置的已知可用版本。
+  **tag 是可变的**，生产环境建议 `--tag <具体版本>` 锁死；装完会打印内容摘要供核对。
 - `self` 形态使用 `caddy:2-alpine`；离线环境需提前把该镜像拉好。
+- 若机器上**没装 `ss`**（iproute2），端口占用检查会退回 `/proc/net/tcp`（仍准确），
+  但**识别不出已有的反代进程**（认不出 Caddy/Nginx），反代形态探测可能不准。
 
 ---
 
@@ -586,21 +616,40 @@ ssh -N -L 3066:127.0.0.1:3066 -L 3065:127.0.0.1:3065 root@<服务器IP>
 改完脚本**别再手工点**，跑这个：
 
 ```bash
-bash test-install-agent2api.sh                                    # 37 个用例（带域名与流式时全跑）
-TEST_DOMAIN=a2a.example.com bash test-install-agent2api.sh        # 加 5 个域名/TLS 用例
+bash test-install-agent2api.sh                                    # 40 个用例（带域名与流式时全跑）
+TEST_DOMAIN=a2a.example.com bash test-install-agent2api.sh        # 加 6 个域名/TLS 用例
 EXISTING_DOMAINS="你的站1 你的站2" bash test-install-agent2api.sh # 附带回检生产站未被影响
 # 流式用例要指向「已有真实账号」的端点（可与被测机器不是同一台）：
 TEST_STREAM_URL="https://你的网关/v1" TEST_API_KEY="wbk_xxx" TEST_MODEL="模型名" \
   bash test-install-agent2api.sh
 KEEP=1 bash test-install-agent2api.sh                             # 失败时保留现场
+
+# 只跑**零副作用**的分组（全部 --dry-run，不落文件、不起容器、不改反代）—— CI 用的就是这个
+RUN_GROUPS=A,A2 bash test-install-agent2api.sh                      # 参数校验 + 边界异常
 ```
 
 - 退出码 = 失败用例数；`INSTALLER=` 可指定被测脚本路径。
-- 覆盖：参数校验 10 项、**边界与异常 5 项**、**重跑菜单交互 2 项**（每条都对应一个真实修过的 bug）、默认值路径与幂等 4 项、
-  **状态与版本管理 4 项**、端口与容器名冲突 2 项、域名与 TLS 6 项（含**注册开关**，需 `TEST_DOMAIN`）、
-  **流式 SSE 1 项**（需 `TEST_STREAM_URL`+密钥+模型）、卸载 2 项、生产站回检 1 项。
+- 分组名：`A` `A2`（零副作用）、`B`（默认路径与幂等）、`B2` `B3`（状态/版本、重跑菜单）、
+  `C`（端口与容器名冲突）、`D`（域名与 TLS）、`stream`、`uninstall`、`recheck`；默认 `all`。
+- 覆盖：参数校验 10 项、**边界与异常 8 项**（含「dry-run 绝不安装」「--upgrade 不擅自装依赖」
+  「参数缺值说人话」「超长数字不溢出」）、**重跑菜单交互 2 项**（每条都对应一个真实修过的 bug）、
+  默认值路径与幂等 4 项、**状态与版本管理 4 项**、端口与容器名冲突 2 项、域名与 TLS 6 项
+  （含**注册开关**，需 `TEST_DOMAIN`）、**流式 SSE 1 项**（需 `TEST_STREAM_URL`+密钥+模型）、
+  卸载 2 项、生产站回检 1 项。
 - **它会真的起容器、真的改反代配置**，跑完自动清理；域名用例要求 `TEST_DOMAIN` 已解析到本机。
+  只想要零副作用回归时用 `RUN_GROUPS=A,A2`。
 - 最近一次完整结果：**28 通过 / 0 失败 / 0 跳过**（2026-09-28，Debian 12 测试机）。
+
+### CI 覆盖了什么、没覆盖什么
+
+| job | 覆盖 | 需要 root/docker |
+| --- | --- | :---: |
+| `static` | `bash -n`、CRLF、严格模式、shellcheck（仅告警） | 否 |
+| `regression` | 回归套件 `RUN_GROUPS=A,A2`，并**复核零残留**（无容器、无目录） | 是 |
+| `smoke` | 6 条错误路径必须 rc≠0 **且** 输出含预期文案 | 是 |
+
+**B 组及以后不进 CI**：它们会起真实容器、改真实 Caddyfile。这样安排的代价是
+「默认值路径与幂等」仍靠手工在专用机器上跑，CI 只能保证「参数层与错误路径」不退化。
 
 ### ⚠️ 自动化**未覆盖**、仅手工验证过的部分
 
@@ -613,6 +662,68 @@ KEEP=1 bash test-install-agent2api.sh                             # 失败时保
 | **`--with-manager` 免粘贴取 Key** | 逻辑与库读取命令手工验证过，**未做端到端** | 会改动生产 manager 的上游列表，不适合放进自动回归 |
 | **`--caddy-mode` 强制指定** | 仅验证了 fail-fast 分支 | 正常分支需改动 80/443 归属 |
 | **Nginx 提示输出** | 手工验证输出正确 | 需要腾出 80/443 并放非 Caddy 监听 |
+| **`verify_tls` 的 502 分支** | 手工构造反代后端不可达验证过 | 需要一个「证书正常但后端挂掉」的现场 |
 
 > 为什么要这个套件：先前出现过「所有测试都显式传了 `--expose`，于是交互分支的 bug 长期没被发现」。
 > 用例必须覆盖**默认值路径**与**异常路径**，不能只测「正确用法」。
+
+---
+
+## v1.7.1 修掉了什么
+
+一次外部审查（通读全文 + 拉上游 workbuddy-manager 源码查证端点 + 在真实机器上实测）发现的问题，
+按严重度排列。**每一条都是可复现的，不是猜测。**
+
+| 级别 | 问题 | 修法 |
+| --- | --- | --- |
+| P0 | 反代连不上后端返回 **502**，被报成「证书尚未就绪」，并把用户指向 DNS／安全组——**三个方向一个都不对** | `verify_tls` 先单独验 TLS 握手拿到证书，再看 HTTP 状态；502/504 单独成案，直接指向容器网络 |
+| P0 | manager 自动登记用**可能已过期**的环境变量密码登录。该项目同一用户名失败 **5 次即锁 10 分钟**，重跑脚本会把自己锁在外面 | 登录失败明确区分「密码不对」与「其它问题」，提示别重跑，并给出两条出路 |
+| P0 | **`--dry-run` 仍会真的装 Docker 和 compose**，装完还打印「不实际改动」——文案与行为矛盾 | dry-run 分支改为**只检测**，缺什么说明什么，绝不安装/不启动 |
+| P0 | `--upgrade` 不在「不擅自装依赖」白名单里，跑一次就能给人家装一整套 Docker | 白名单补 `DO_UPGRADE` |
+| P1 | 反代在容器里但**取不到共享网络**时静默回落 `127.0.0.1`，容器够不到宿主回环 → 502（而 validate 通过） | 取不到网络就直接中止并说清怎么查，不猜 |
+| P1 | 只有 `INT/TERM` 兜底；`set -e` 触发的退出**不还原 Caddyfile** | 抽出 `restore_caddy`，同时挂 `ERR`/`EXIT` |
+| P1 | `rm -rf "$INSTALL_DIR"` 没有路径白名单，`--dir /opt` 一次确认就能端掉整棵 `/opt` | 顶层目录全部拒绝删除 |
+| P1 | `strip_managed_block` 用 `cat >` 原地覆盖 Caddyfile，**非原子**，中断即截断 | 先 cp 做载体（继承权限）再 `mv` 原子替换 |
+| P2 | 参数缺值时用户看到 bash 的 `shift count out of range` | 统一前置校验并说人话 |
+| P2 | `--mem 99999999999999g` / `--panel-port 9999...` 能过正则，但算术**溢出** | 位数先卡死（内存 ≤6 位、端口 ≤5 位） |
+| P2 | 机器没装 `ss` 时，端口检查把「命令不存在」当成「端口空闲」，自建 Caddy 一路走到 `docker up` 才撞 80/443 | 加 `/proc/net/tcp{,6}` 兜底（纯 awk 十六进制转换，不用 gawk 专有的 `strtonum`） |
+### 分发与可核对性
+
+| 问题 | 修法 |
+| --- | --- |
+| `deploy.sh` 只做 `bash -n`，网盘静态副本能被换掉而不被发现 | 三级校验：shebang → 含 `SCRIPT_VERSION` →（可选）`EXPECT_SHA256` 比对 |
+| **校验失败后，不合格的内容仍然留在 `$TARGET` 上**（默认 `/root/install-agent2api.sh`）——用户手动跑它，跑的就是没通过校验的文件 | 改成**先下到临时文件，校验通过才 `install` 到目标路径**；失败时目标路径完全不被碰 |
+| 跑起来后看不出到底在跑哪个镜像内容 | 打印镜像内容摘要 `sha256:…`；用 `latest` 时显式警告 tag 可变 |
+| 回归套件**从未在提交时自动跑**（仓库无 CI） | 新增 GitHub Actions：`static` / `regression`（A、A2 组）+ `smoke` |
+
+### 测试套件本身修的（这几条只有真跑才暴露）
+
+| 问题 | 修法 |
+| --- | --- |
+| 分组开关的变量名原本叫 `GROUPS` —— **那是 bash 的只读内建数组**（当前用户的组 ID），赋值被静默忽略 | 改名 `RUN_GROUPS`，注释里写明原因 |
+| 组名对不上（文档写 `A,A2`、代码判 `args`），**一个用例都不跑、退出码却是 0** | 统一组名；并加「零执行必须判失败」兜底 |
+| 被测脚本没有 `+x` 时每个用例都是 `rc=126`，而**只断言 `rc≠0` 的用例在这情况下会假通过**（实测 15 个失败里 3 个显示 ✓） | `preflight` 自动补 `chmod +x`；给宽松用例补上文案断言 |
+| `! a \| grep` 的优先级是 `(!a) \| grep`，「没有算术溢出」这条断言恒为假 | 改用 `if … then overflow=1; fi` |
+| 「参数缺值」防呆检查把所有 `-` 开头的值都拦下，抢在容器名校验之前，改变了既有行为 | 只在下一个参数是**本脚本认识的选项**时才提示漏写值 |
+
+### 实测结果（Debian 12 + Docker，2026-10-06）
+
+| 项 | 结果 |
+| --- | --- |
+| 三个脚本 `bash -n` | 通过 |
+| 全部文件 CR 计数 | 0 |
+| `RUN_GROUPS=A,A2` 回归 | **18 通过 / 0 失败 / 0 跳过，RC=0** |
+| `smoke` 6 条错误路径 | 全通过（每条都断言「rc≠0 **且** 输出含预期文案」） |
+| `deploy.sh` 三级校验（对 / 错 / 不设 三种情况） | 行为均符合预期，失败时目标路径零污染 |
+| **生产环境复核** | 容器列表、监听端口、`/opt/agent2api/docker-compose.yml` 与 `Caddyfile` 的 SHA256 **逐项与测试前基线一致**，测试残留为零 |
+
+> ⚠️ **仍未验证**（诚实列出，别把上面那张表读成「一切都验过了」）：
+>
+> - **真实安装路径**（B 组及以后：起真实容器、绑真实域名签证书、SSE 流式、升级回滚、卸载）。
+>   这需要一台能从零开始的干净机器并改动真实反代，本次没有这样的环境。
+> - `verify_tls` 的 502 分支、`restore_caddy` 的 `ERR`/`EXIT` 触发：需要可控的故障时机。
+> - `self` 自建 Caddy 形态（需 80/443 空闲）。
+> - `--with-manager` 端到端（会改动真实 manager 的上游列表）。
+>
+> 补齐前两项：在一台**可随意重装**的机器上跑
+> `RUN_GROUPS=all TEST_DOMAIN=<已解析到本机的域名> bash test-install-agent2api.sh`。

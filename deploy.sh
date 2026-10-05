@@ -28,6 +28,39 @@ SOURCES=(
 
 say() { printf '  %s\n' "$1"; }
 
+# ── 下载内容的三级校验 ──────────────────────────────────────────────────────
+# ⚠️ 原来只做 `bash -n`（语法检查）。那挡不住两件事：
+#   ① 下载源挂了返回 HTML/JSON 错误页 —— 有小概率仍是"合法 shell"；
+#   ② 第一源是**静态副本**（网盘），与 GitHub main 会漂移；有人改了网盘上的文件，
+#      语法完全正常，但内容已经不是同一个东西了。
+# 三级：① 必须像安装器 ② 版本号可读 ③ 期望摘要相符（设了才查）。
+# 想强校验：EXPECT_SHA256=<64位十六进制> curl … | sudo bash
+EXPECT_SHA256="${EXPECT_SHA256:-}"
+verify_downloaded() {   # $1=文件；返回 0=通过
+  local f="$1" head1 ver
+  head1=$(head -c 2 "$f" 2>/dev/null || true)
+  if [ "$head1" != "#!" ]; then
+    say "× 下载到的不是可执行脚本（缺少 shebang，可能是错误页）"
+    return 1
+  fi
+  ver=$(grep -m1 '^SCRIPT_VERSION=' "$f" 2>/dev/null | cut -d'"' -f2 || true)
+  if [ -z "$ver" ]; then
+    say "× 下载到的脚本里没有 SCRIPT_VERSION —— 不是 agent2api 安装器"
+    return 1
+  fi
+  if [ -n "$EXPECT_SHA256" ]; then
+    local got
+    got=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1 || true)
+    if [ "$got" != "$EXPECT_SHA256" ]; then
+      say "× SHA256 不符 —— 期望 $EXPECT_SHA256，实际 ${got:-取不到}"
+      return 1
+    fi
+    say "  ✓ SHA256 相符"
+  fi
+  bash -n "$f" 2>/dev/null || { say "× 语法检查不通过"; return 1; }
+  return 0
+}
+
 if [ "$(id -u)" != 0 ]; then
   # 别无脑提示「加 sudo」—— 很多精简镜像根本没装 sudo（登录就是 root）
   if command -v sudo >/dev/null 2>&1; then
@@ -47,18 +80,32 @@ say "------------------------------------------------------------"
 say "正在下载安装器（会依次尝试 ${#SOURCES[@]} 个源）…"
 
 ok=0
+# 🔴 下载到**临时文件**，校验通过才 install 到 $TARGET。
+#   原来直接 curl -o "$TARGET"：校验失败时那份不合格的内容**仍然留在磁盘上**
+#   （默认就是 /root/install-agent2api.sh）。用户看到「所有源都没成功」，
+#   却可能稍后手动 `bash /root/install-agent2api.sh` —— 跑的正是没通过校验的文件。
+#   实测踩过：三个源全被 SHA256 拒绝后，$TARGET 里仍躺着 95874 字节的过期内容。
+CAND="$(mktemp -d)/installer.sh"
+cleanup() { rm -rf "$(dirname "$CAND")"; }
+trap cleanup EXIT
+
 for u in "${SOURCES[@]}"; do
   host=$(printf '%s' "$u" | awk -F/ '{print $3}')
-  if curl -fsSL --max-time 60 "$u" -o "$TARGET" 2>/dev/null && [ -s "$TARGET" ] && bash -n "$TARGET" 2>/dev/null; then
-    say "✓ 来自 $host（$(wc -c < "$TARGET" | tr -d ' ') 字节）"
-    ok=1
-    break
+  if curl -fsSL --max-time 60 "$u" -o "$CAND" 2>/dev/null && [ -s "$CAND" ] && verify_downloaded "$CAND"; then
+    if install -m 0755 "$CAND" "$TARGET" 2>/dev/null || { cp "$CAND" "$TARGET" && chmod +x "$TARGET"; }; then
+      say "✓ 来自 $host（$(wc -c < "$TARGET" | tr -d ' ') 字节）"
+      ok=1
+      break
+    fi
+    say "× 写不进 $TARGET，换下一个源"
   fi
-  say "× $host 不可用，换下一个"
+  rm -f "$CAND"
+  say "× $host 不可用或校验不通过，换下一个"
 done
 
 if [ "$ok" != 1 ]; then
-  say "所有源都没成功。可以自己下载后放到 $TARGET 再执行。"
+  say "所有源都没成功。**$TARGET 未被写入**（原先那份如果有，也原封未动）。"
+  say "可以自己下载后放到 $TARGET 再执行。"
   exit 1
 fi
 
@@ -66,7 +113,11 @@ chmod +x "$TARGET" 2>/dev/null || true
 ver=$(grep -m1 '^SCRIPT_VERSION=' "$TARGET" 2>/dev/null | cut -d'"' -f2 || true)
 say "版本：${ver:-未知}    路径：$TARGET"
 if command -v sha256sum >/dev/null 2>&1; then
-  say "SHA256：$(sha256sum "$TARGET" | cut -c1-16)…"
+  got_sha=$(sha256sum "$TARGET" | cut -d' ' -f1)
+  say "SHA256：${got_sha}"
+  if [ -z "$EXPECT_SHA256" ]; then
+    say "  （未设置 EXPECT_SHA256，本次只做了「是不是安装器 + 语法」两级校验）"
+  fi
 fi
 say "------------------------------------------------------------"
 echo
