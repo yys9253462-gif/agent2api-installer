@@ -55,14 +55,22 @@ jobs:
           shellcheck -S warning -e SC2317,SC2154,SC2086 ./*.sh || true
 
       - name: 脚本头部必须带严格模式
-        # 少了 set -euo pipefail 的脚本，出错的形态完全不一样（错误被静默吞掉），
-        # 属于会一路带到线上才炸的那类。
+        # ⚠️ test-install-agent2api.sh **刻意不带 -e** —— 它要的是「单个用例失败也继续跑完」，
+        #    集齐所有失败再统一退出。对它强制 -e 会让套件在第一个失败处就中断，
+        #    后面 39 个用例根本没跑，等于把「全量回归」降级成「只测第一个」。
+        #    所以反过来把「它必须保持不带 -e」也当成一条要守护的约束。
+        #    （第一版没豁免它，CI 第一次跑就红了 —— 这条检查本身就是被这次实测校准出来的。）
         run: |
           set -euo pipefail
-          for f in ./*.sh; do
+          for f in ./install-agent2api.sh ./deploy.sh; do
             grep -qE '^set -[A-Za-z]*e' "$f" || { echo "✗ $f 没有 set -e"; exit 1; }
             echo "✓ $f  $(grep -m1 -E '^set -' "$f")"
           done
+          if grep -qE '^set -uo pipefail' ./test-install-agent2api.sh; then
+            echo "✓ ./test-install-agent2api.sh  刻意用 set -uo pipefail（不带 -e，才能跑完全部用例）"
+          else
+            echo "✗ 测试套件的严格模式被改动了 —— 请确认是有意的，并同步修改本检查"; exit 1
+          fi
 
   # ─────────────────────────────────────────────────────────────
   # 2) 回归套件的**零副作用**分组（A / A2）
@@ -115,9 +123,14 @@ jobs:
         #   而那已经在 need_root + check_docker 之后了。GitHub runner 自带 docker。
         run: docker version && docker compose version
       - name: 缺值 / 非法枚举 / 数值越界都必须说人话
-        # 判据是「以人类可读的方式失败」：rc≠0 **且** 输出里出现预期文案。
-        #   以前缺值时用户看到的是 bash 的 `shift: shift count out of range`。
+        # ⚠️ **第一行必须是 `set +e`**。
+        #    GitHub 的 `run:` 默认 shell 是 `bash --noprofile --norc -eo pipefail`，
+        #    带着 `-e`。而这个步骤测的恰恰是「命令应该以非 0 退出」——
+        #    带着 -e 跑，第一条 expect_fail 里 `out=$(...)` 拿到非 0 就把整个步骤带崩，
+        #    **连失败输出都来不及打**。实测踩过：6 条 expect_fail 一条结果都没出现在日志里，
+        #    只看到 `##[error]Process completed with exit code 1.`，等于白跑。
         run: |
+          set +e
           set -uo pipefail
           fail=0
           expect_fail() { # expect_fail <应含的文案> <参数...>
@@ -135,4 +148,6 @@ jobs:
           expect_fail "格式"         --dry-run -y --mem 384mb
           expect_fail "范围"         --dry-run -y --panel-port 99999
           expect_fail "caddy-mode"   --dry-run -y --caddy-mode bogus
+          echo "-----"
+          [ "$fail" = 0 ] && echo "6 条错误路径全部说人话" || echo "共 $fail 条不合格"
           exit $fail
