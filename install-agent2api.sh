@@ -24,7 +24,7 @@
 #
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.0"
+SCRIPT_VERSION="1.8.1"
 DEFAULT_IMAGE_REPO="aimodcc/agent2api"
 DEFAULT_TAG="2.9.1"          # 离线兜底用的「已知可用版本」（只在查不到 Docker Hub 时才用；线上实测 healthy）
 DEFAULT_DIR="/opt/agent2api"
@@ -842,12 +842,44 @@ strip_managed_block() {
   #   而本函数自己不备份（apply_domain 的备份在调用前才做，别处不一定有）。
   #   改成：先 cp 原文件做载体（继承权限/属主），内容写进载体，最后 mv 原子替换。
   #   中途失败只会留下垃圾临时文件，不会把线上配置改坏。
-  if cp "$f" "$staged" 2>/dev/null && cat "$tmp" > "$staged"; then
+  #
+  # 🔴🔴 但上面那条「cp 继承权限」有个致命前提：**目标文件必须不存在**。
+  #   mktemp 建出来的 staged 是 **600**，而 `cp 源 已存在的目标` 只写内容、
+  #   **不改目标的权限** —— 于是 mv 替换之后，原本 644 的 Caddyfile 变成 600。
+  #   实测踩过：Caddy 服务以 caddy 用户跑，读不了 root 的 600 文件 →
+  #   reload 失败 → 且**回滚走同一条路径，回滚后权限还是 600**，
+  #   等于装一次就把机器上原有的网站搞挂（老进程还握着旧句柄，重启才炸）。
+  #   ⇒ 修法：用 `cp -p`（保留权限/属主/时间）显式覆盖，或建好载体后 chmod 对齐。
+  preserve_perm_copy "$f" "$staged" || { rm -f "$tmp" "$staged"; return 1; }
+  if cat "$tmp" > "$staged"; then
     mv -f "$staged" "$f" || rm -f "$staged"
   else
     rm -f "$staged"
   fi
   rm -f "$tmp"
+}
+
+# 把 src 的权限/属主复制到 dst 上，然后让内容可写。
+# 为什么不用 `cp -p src dst`：dst 是 mktemp 造的、属主是当前用户，
+#   cp -p 会连属主一起改，非 root 场景可能失败。这里只保证「权限位」一致，
+#   属主保持不动（脚本本来就以目标文件同属主的身份运行）。
+preserve_perm_copy() {
+  local src="$1" dst="$2"
+  [ -f "$src" ] || return 1
+  [ -f "$dst" ] || return 1
+  local mode
+  mode=$(stat -c '%a' "$src" 2>/dev/null) || mode=""
+  if [ -n "$mode" ]; then
+    chmod "$mode" "$dst" 2>/dev/null || true
+  fi
+  # 属主：能改就跟着改（root 场景），改不了也不致命
+  local owner group
+  owner=$(stat -c '%u' "$src" 2>/dev/null) || owner=""
+  group=$(stat -c '%g' "$src" 2>/dev/null) || group=""
+  if [ -n "$owner" ] && [ -n "$group" ]; then
+    chown "$owner:$group" "$dst" 2>/dev/null || true
+  fi
+  return 0
 }
 
 # ── 状态文件 ────────────────────────────────────────────────────────────────
@@ -1590,6 +1622,7 @@ apply_domain() {
     problem "Caddyfile 里已经存在 ${DOMAIN} 的站点块（不在本脚本的托管块内）"
     info "请先手工处理该冲突（合并或删除旧块）再重跑本脚本。"
     cp "$BACKUP_FILE" "$CADDY_FILE"
+    restore_caddy_perm "$CADDY_FILE"
     die "已回滚，未做改动。"
   fi
 
@@ -1599,13 +1632,28 @@ apply_domain() {
     problem "Caddyfile 校验失败，正在回滚"
     sed -n '1,6p' /tmp/.a2a-validate | sed 's/^/    /'
     cp "$BACKUP_FILE" "$CADDY_FILE"
+    restore_caddy_perm "$CADDY_FILE"
     die "已回滚，生产反代未受影响。"
   fi
   ok "Caddyfile 校验通过"
 
+  # 🔴 关键补漏：`caddy validate` 是 root 跑的，能读任何文件；
+  #   而反代服务以 caddy 用户跑，读不了 root 的 600 文件 ——
+  #   于是出现「校验通过、reload 失败」这种最迷惑的现象（实测踩过）。
+  #   这里以服务真实身份试读一次，读不到就先修权限，再放行去 reload。
+  if ! verify_caddyfile_readable_by_service; then
+    problem "反代服务读不到 Caddyfile，重载不可能成功"
+    cp "$BACKUP_FILE" "$CADDY_FILE"; restore_caddy_perm "$CADDY_FILE"
+    die "已回滚，未做改动。"
+  fi
+
   if ! caddy_reload; then
     problem "Caddy 重载失败，正在回滚"
-    cp "$BACKUP_FILE" "$CADDY_FILE"; caddy_reload || true
+    # 🔴 回滚同样要保住权限：备份文件是 644，直接 cp 到「已被改成 600」的
+    #   目标上不会恢复权限位（cp 不覆盖目标的 mode），回滚等于没回滚。
+    cp "$BACKUP_FILE" "$CADDY_FILE"
+    restore_caddy_perm "$CADDY_FILE"
+    caddy_reload || true
     die "已回滚。"
   fi
   ok "Caddy 已重载（未重启容器、未断现有连接）"
@@ -1685,6 +1733,73 @@ verify_caddyfile_visible_in_container() {
   info "  · 容器：${cn}  容器内路径：${inner}"
   info "  · 手工核对：docker exec ${cn} cat ${inner}"
   info "  · 若长期不一致，改用「目录挂载」替代单文件挂载（改 compose 的 volumes）"
+  return 1
+}
+
+# 把 Caddyfile 的权限调整到「反代进程真的能读」的程度。
+# Caddy 以 caddy 用户跑时，root 的 600 文件它读不了 —— 而 `caddy validate`
+# 是 root 跑的、照样能读，于是出现「校验通过但 reload 失败」这种最迷惑的现象。
+restore_caddy_perm() {
+  local f="$1"
+  [ -f "$f" ] || return 0
+  local mode
+  mode=$(stat -c '%a' "$f" 2>/dev/null) || return 0
+  # 只处理「属主独占」这一类；其余权限（如 640）不动，交给下面的可读性校验兜底
+  case "$mode" in
+    600|700)
+      chmod 644 "$f" 2>/dev/null &&         info "已把 $f 权限从 $mode 调整为 644（反代服务需要可读）"
+      ;;
+  esac
+  return 0
+}
+
+# 校验「反代服务自己」能不能读到配置文件。
+# 判据：以反代进程的运行用户去试读；读不到就是必然失败，早报比等 reload 报错清楚。
+verify_caddyfile_readable_by_service() {
+  [ "$DRY_RUN" = 1 ] && return 0
+  local f="$CADDY_FILE"
+  [ -f "$f" ] || return 0
+
+  # 先按需修权限（这一步能自动救回被改成 600 的文件）
+  restore_caddy_perm "$f"
+
+  local svc_user=""
+  case "$CADDY_MODE" in
+    host)
+      # 宿主 Caddy：看 systemd 单元里以什么身份跑
+      svc_user=$(systemctl show caddy -p User --value 2>/dev/null || true)
+      ;;
+    docker|self)
+      # 容器 Caddy：容器内进程通常是 root（官方镜像默认），不做用户级校验
+      return 0
+      ;;
+    *) return 0 ;;
+  esac
+
+  # 空 = 以 root 跑，那必然能读
+  [ -n "$svc_user" ] && [ "$svc_user" != "root" ] || return 0
+
+  if ! id "$svc_user" >/dev/null 2>&1; then
+    return 0    # 用户不存在（可能自定义），不误报
+  fi
+
+  if su -s /bin/sh "$svc_user" -c "test -r '$f'" 2>/dev/null; then
+    return 0
+  fi
+
+  # 读不到 → 强行把权限放开（这是线上可用性的第一优先级）
+  warn "反代服务（用户 ${svc_user}）读不到 $f（当前权限 $(stat -c '%a' "$f" 2>/dev/null)）"
+  info "  正在修正为 644 —— 否则 reload 必然失败，且会让机器上原有网站也起不来"
+  chmod 644 "$f" 2>/dev/null || true
+
+  if su -s /bin/sh "$svc_user" -c "test -r '$f'" 2>/dev/null; then
+    ok "已修正，${svc_user} 现在可以读取"
+    return 0
+  fi
+
+  problem "修正后 ${svc_user} 仍读不到 $f"
+  info "  · 检查上级目录权限：ls -ld $(dirname "$f")"
+  info "  · 检查属主：ls -l $f（当前 $(stat -c '%U:%G %a' "$f" 2>/dev/null)）"
   return 1
 }
 
