@@ -24,7 +24,7 @@
 #
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.8.1"
+SCRIPT_VERSION="1.8.2"
 DEFAULT_IMAGE_REPO="aimodcc/agent2api"
 DEFAULT_TAG="2.9.1"          # 离线兜底用的「已知可用版本」（只在查不到 Docker Hub 时才用；线上实测 healthy）
 DEFAULT_DIR="/opt/agent2api"
@@ -2271,14 +2271,77 @@ print_image_provenance() {
   esac
 }
 
+# ── 管理员注册探测与告警 ────────────────────────────────────────────────────
+# agent2api 的规则是「首个访问者注册管理员」。装完不注册 = 面板裸奔：
+# 域名一旦签了证书就进 CT 日志（会被爬虫主动扫），谁先打开谁就是管理员。
+# 原来只在「绑了域名」的分支里给一句普通提示，没域名时完全不提，
+# 而且那句话混在一大堆输出里，新手极易漏掉。
+
+# 探测管理员注册状态：0=已注册，1=未注册，2=探测不到（不谎报）
+admin_registered_state() {
+  local body
+  body=$(docker exec "$CONTAINER" curl -s --max-time 6 \
+           "http://127.0.0.1:${PANEL_PORT}/api/panel/status" 2>/dev/null || true)
+  [ -n "$body" ] || return 2
+  case "$body" in
+    *'"registered":true'*)  return 0 ;;
+    *'"registered":false'*) return 1 ;;
+    *)                      return 2 ;;
+  esac
+}
+
+# 装完后打印管理员注册提示。$1 = 面板地址
+print_register_notice() {
+  local url="$1" st=0
+  admin_registered_state || st=$?
+
+  printf '\n'
+  if [ "$st" = 0 ]; then
+    printf '%s  ✓ 管理员已注册，面板已经锁上了（别人抢不走）%s\n' "$C_GRN" "$C_OFF"
+    printf '    登录地址：%s%s%s\n' "$C_BLD" "$url" "$C_OFF"
+    return 0
+  fi
+
+  if [ "$st" = 2 ]; then
+    printf '%s  ？ 读不到面板的注册状态（容器可能刚起、接口还没就绪）%s\n' "$C_YEL" "$C_OFF"
+    printf '    请自己打开看一眼：%s%s%s\n' "$C_BLD" "$url" "$C_OFF"
+    printf '    %s如果页面让你「设置管理员」，说明还没注册 —— 请立刻注册。%s\n' "$C_DIM" "$C_OFF"
+    return 0
+  fi
+
+  # ── 未注册 ──
+  if [ "$LOCK_REGISTER" = "y" ]; then
+    printf '%s  ⚠ 管理员还没注册%s，但公网注册已封，别人抢不走。\n' "$C_YEL" "$C_OFF"
+    printf '    注册走 SSH 隧道（在你自己的电脑上敲）：\n'
+    printf '      %sssh -N -L %s:127.0.0.1:%s root@<你的服务器IP>%s\n' \
+      "$C_DIM" "$PANEL_PORT" "$PANEL_PORT" "$C_OFF"
+    printf '    然后浏览器打开 %shttp://127.0.0.1:%s/%s 注册。\n' "$C_BLD" "$PANEL_PORT" "$C_OFF"
+    return 0
+  fi
+
+  # 🔴 高危：公网可达 + 未注册 = 任何人可抢注
+  printf '%s╔══════════════════════════════════════════════════════════╗%s\n' "$C_RED" "$C_OFF"
+  printf '%s║   现在必须做一件事：立刻去注册管理员                     ║%s\n' "$C_RED" "$C_OFF"
+  printf '%s╚══════════════════════════════════════════════════════════╝%s\n' "$C_RED" "$C_OFF"
+  printf '\n'
+  printf '  为什么急：agent2api 的规则是%s「第一个打开面板的人自动成为管理员」%s。\n' "$C_BLD" "$C_OFF"
+  printf '  这个域名已经申请了公开证书（会进 CT 日志，爬虫会扫到）。\n'
+  printf '  %s在你注册之前，任何扫到它的人都能抢先注册、拿走管理员权限。%s\n' "$C_RED" "$C_OFF"
+  printf '\n'
+  printf '  现在就做（1 分钟）：\n'
+  printf '    ① 浏览器打开：%s%s%s\n' "$C_BLD" "$url" "$C_OFF"
+  printf '    ② 按页面提示设用户名和密码%s（随便设，记住就行）%s\n' "$C_DIM" "$C_OFF"
+  printf '    ③ 进去后先去「账号」加上游 —— 少了这步客户端拿不到任何模型\n'
+  printf '\n'
+  printf '  %s下次不想看到这条：装的时候加 --lock-register（注册就只走 SSH 隧道）%s\n' "$C_DIM" "$C_OFF"
+  printf '  %s已经注册过了？直接登录即可，这条可无视。%s\n' "$C_DIM" "$C_OFF"
+}
+
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 summary() {
   # 管理员注册状态（决定"下一步"该说注册还是说登录）
   local registered=0
-  if docker exec "$CONTAINER" curl -s --max-time 6 "http://127.0.0.1:${PANEL_PORT}/api/panel/status" 2>/dev/null \
-     | grep -q '"registered":true'; then
-    registered=1
-  fi
+  if admin_registered_state; then registered=1; fi
 
   local panel_url
   if [ -n "$DOMAIN" ]; then panel_url="https://${DOMAIN}/"; else panel_url="http://127.0.0.1:${PANEL_PORT}/"; fi
@@ -2295,16 +2358,14 @@ summary() {
     printf '%s  下一步：用浏览器打开面板，注册一个管理员账号%s\n' "$C_BLD" "$C_OFF"
   fi
   printf '%s════════════════════════════════════════════════════════%s\n' "$C_BLD" "$C_OFF"
+
+  # 🔴 管理员注册告警：独立、醒目，且【不区分有没有域名】——
+  #    没绑域名时面板只在隧道里可达，但同样没注册，原来那条路一个字都不提。
+  print_register_notice "$panel_url"
   printf '\n'
 
   if [ -n "$DOMAIN" ]; then
-    printf '  打开这个网址：%s%s%s\n' "$C_BLD" "$panel_url" "$C_OFF"
-    [ "$registered" = 1 ] || printf '  然后按页面提示设个用户名和密码（随便设，记住就行）。\n'
-    if [ "$registered" != 1 ] && [ "$LOCK_REGISTER" != "y" ]; then
-      printf '\n'
-      problem "这一步请尽快做：现在任何人打开这个网址，都能抢先注册成管理员"
-      info "${C_DIM}（不想这样：重跑时加 --lock-register，注册就只走 SSH 隧道）${C_OFF}"
-    fi
+    : # 面板地址已在上面的注册提示里给出，这里不再重复
   else
     # 不绑域名 → 面板只能从用户自己的电脑访问。新手最容易卡在这一步：
     # 要开隧道、还会被问密码。所以分两步写清楚，连"会问密码""看着像卡住是正常的""窗口不能关"都说明白。

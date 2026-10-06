@@ -657,6 +657,70 @@ DE0F
   verdict $? "rc=$rc（宿主模式应静默放行）"
 }
 
+case_register_notice_branches() {
+  begin "管理员注册告警：四种状态各说各话，且不谎报"
+  # 背景：agent2api 是「首个访问者注册管理员」。装完不注册 = 面板裸奔。
+  # 原来只在「绑了域名」的分支给一句普通提示，没域名时完全不提。
+  # 这里验证四分支：已注册 / 未注册+公网 / 未注册+已封 / 探测不到。
+  # 用函数打桩验证分支逻辑（不绕过真实 captcha，只测告警文案走向）。
+  local fn=/tmp/.a2a-rn-$$.sh
+  awk '/^main\(\) \{/{exit} {print}' "$INSTALLER" > "$fn"
+  [ -s "$fn" ] || { skip "无法提取函数定义"; return; }
+
+  local out_stub drv_ok=0
+  # 场景 1：已注册 → 应含「已注册」且不含「抢」
+  cat > /tmp/.a2a-d1-$$.sh <<D1
+#!/usr/bin/env bash
+source "$fn"
+admin_registered_state() { return 0; }
+CONTAINER=x; PANEL_PORT=1; LOCK_REGISTER=n; DOMAIN=test.example
+print_register_notice "https://test.example/"
+D1
+  out_stub=$(bash /tmp/.a2a-d1-$$.sh 2>&1)
+  { printf '%s' "$out_stub" | grep -q '已注册' \
+      && ! printf '%s' "$out_stub" | grep -q '抢注\|抢先注册'; } && drv_ok=$((drv_ok+1))
+
+  # 场景 2：未注册 + 公网 → 必须醒目警告「抢先」
+  cat > /tmp/.a2a-d2-$$.sh <<D2
+#!/usr/bin/env bash
+source "$fn"
+admin_registered_state() { return 1; }
+CONTAINER=x; PANEL_PORT=1; LOCK_REGISTER=n; DOMAIN=test.example
+print_register_notice "https://test.example/"
+D2
+  out_stub=$(bash /tmp/.a2a-d2-$$.sh 2>&1)
+  { printf '%s' "$out_stub" | grep -q '抢先注册' \
+      && printf '%s' "$out_stub" | grep -q '立刻去注册管理员'; } && drv_ok=$((drv_ok+1))
+
+  # 场景 3：未注册 + 已封注册端点 → 应提示走隧道，而不是报警
+  cat > /tmp/.a2a-d3-$$.sh <<D3
+#!/usr/bin/env bash
+source "$fn"
+admin_registered_state() { return 1; }
+CONTAINER=x; PANEL_PORT=1; LOCK_REGISTER=y; DOMAIN=test.example
+print_register_notice "https://test.example/"
+D3
+  out_stub=$(bash /tmp/.a2a-d3-$$.sh 2>&1)
+  { printf '%s' "$out_stub" | grep -q 'ssh -N -L' \
+      && ! printf '%s' "$out_stub" | grep -q '抢先注册'; } && drv_ok=$((drv_ok+1))
+
+  # 场景 4：探测不到 → 不许谎报「已注册」，要给可复核判据
+  cat > /tmp/.a2a-d4-$$.sh <<D4
+#!/usr/bin/env bash
+source "$fn"
+admin_registered_state() { return 2; }
+CONTAINER=x; PANEL_PORT=1; LOCK_REGISTER=n; DOMAIN=test.example
+print_register_notice "https://test.example/"
+D4
+  out_stub=$(bash /tmp/.a2a-d4-$$.sh 2>&1)
+  { printf '%s' "$out_stub" | grep -q '读不到' \
+      && ! printf '%s' "$out_stub" | grep -q '已注册，面板'; } && drv_ok=$((drv_ok+1))
+
+  rm -f /tmp/.a2a-d1-$$.sh /tmp/.a2a-d2-$$.sh /tmp/.a2a-d3-$$.sh /tmp/.a2a-d4-$$.sh "$fn"
+  [ "$drv_ok" = 4 ]
+  verdict $? "通过分支 $drv_ok/4"
+}
+
 # ── 主流程 ──────────────────────────────────────────────────────────────────
 preflight
 
@@ -676,6 +740,7 @@ if want A2; then
   case_arg_missing_value; case_huge_numbers
   case_mem_too_small; case_bad_caddy_mode
   case_inode_trap_prefly
+  case_register_notice_branches
 fi
 
 if want default; then
