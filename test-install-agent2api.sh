@@ -557,6 +557,106 @@ case_existing_sites() {
   verdict $? "异常站点：${bad:-无}"
 }
 
+case_inode_trap_guard() {
+  begin "容器内看不到站点块（inode 陷阱）能被自动检测并自愈"
+  # 背景：脚本先建只有注释头的空 Caddyfile，中间隔着「拉起 Caddy 容器」，
+  #       最后才追加站点块；容器启动时绑定的是「空文件」的 inode，
+  #       之后脚本用 mv 替换文件（原子写法）产生新 inode，容器仍盯着旧的。
+  #       结果：宿主上文件完整，容器里只有一行注释头 → 不签证书 → 公网 503。
+  #       实测踩过，故此处固化为回归用例。
+  #
+  # 判据：构造同样的时序，然后调用脚本里的
+  #       verify_caddyfile_visible_in_container()，应能检测到并自愈（返回 0）。
+  command -v docker >/dev/null 2>&1 || { skip "无 docker"; return; }
+
+  local td cn cn_name="a2a-inode-$$"
+  td="$(mktemp -d)"
+  cn="$cn_name"
+
+  # 步骤 1：初始化态文件（只有注释头）
+  printf '# managed by install-agent2api.sh\n' > "$td/Caddyfile"
+
+  # 步骤 2：起容器并挂载这个空文件
+  docker run -d --name "$cn" \
+    -v "$td/Caddyfile:/etc/caddy/Caddyfile:ro" \
+    --entrypoint sleep caddy:2-alpine infinity >/dev/null 2>&1 \
+    || { rm -rf "$td"; skip "无法启动测试容器（可能拉不到 caddy 镜像）"; return; }
+  sleep 3
+
+  # 步骤 3：用 mv 替换写入完整内容（与脚本 strip+append 的写法一致）
+  cat > "$td/new" <<'CEOF'
+# managed by install-agent2api.sh
+agent.regress.test {
+	reverse_proxy 127.0.0.1:3065
+}
+CEOF
+  mv "$td/new" "$td/Caddyfile"
+
+  # 确认故障确实注入了（否则用例没验证到任何东西）
+  local h_md5 c_md5
+  h_md5=$(md5sum "$td/Caddyfile" | awk '{print $1}')
+  c_md5=$(docker exec "$cn" md5sum /etc/caddy/Caddyfile 2>/dev/null | awk '{print $1}')
+  if [ "$h_md5" = "$c_md5" ]; then
+    docker rm -f "$cn" >/dev/null 2>&1; rm -rf "$td"
+    skip "未复现不一致（inode 被复用），本机不适用"
+    return
+  fi
+
+  # 调用脚本里的函数（提取函数定义，避开 main）
+  local fn=/tmp/.a2a-funcs-$$.sh drv=/tmp/.a2a-drv-$$.sh
+  awk '/^main\(\) \{/{exit} {print}' "$INSTALLER" > "$fn"
+
+  cat > "$drv" <<DE0F
+#!/usr/bin/env bash
+source "$fn"
+CADDY_MODE="docker"
+CADDY_CONTAINER="$cn"
+CADDY_SELF_CONTAINER=""
+CADDY_FILE="$td/Caddyfile"
+CADDY_INNER="/etc/caddy/Caddyfile"
+DRY_RUN=0
+verify_caddyfile_visible_in_container
+exit \$?
+DE0F
+
+  local out rc
+  out=$(bash "$drv" 2>&1); rc=$?
+  local after_h after_c
+  after_h=$(md5sum "$td/Caddyfile" | awk '{print $1}')
+  after_c=$(docker exec "$cn" md5sum /etc/caddy/Caddyfile 2>/dev/null | awk '{print $1}')
+
+  docker rm -f "$cn" >/dev/null 2>&1
+  rm -rf "$td"; rm -f "$fn" "$drv"
+
+  { [ "$rc" = 0 ] && [ "$after_h" = "$after_c" ] \
+      && printf '%s' "$out" | grep -qE 'inode 陷阱|已重新绑定'; }
+  verdict $? "rc=$rc 自愈后一致=$([ "$after_h" = "$after_c" ] && echo 是 || echo 否)"
+}
+
+case_inode_trap_prefly() {
+  begin "inode 校验只在容器 Caddy 模式生效（宿主模式不误报）"
+  # 宿主模式的 Caddyfile 没有 bind mount，不该做这项校验，也不该报错。
+  local fn=/tmp/.a2a-fn2-$$.sh drv=/tmp/.a2a-dr2-$$.sh
+  awk '/^main\(\) \{/{exit} {print}' "$INSTALLER" > "$fn"
+  cat > "$drv" <<DE0F
+#!/usr/bin/env bash
+source "$fn"
+CADDY_MODE="host"
+CADDY_CONTAINER=""
+CADDY_SELF_CONTAINER=""
+CADDY_FILE="/etc/caddy/Caddyfile"
+CADDY_INNER="/etc/caddy/Caddyfile"
+DRY_RUN=0
+verify_caddyfile_visible_in_container
+exit \$?
+DE0F
+  local out rc
+  out=$(bash "$drv" 2>&1); rc=$?
+  rm -f "$fn" "$drv"
+  { [ "$rc" = 0 ] && ! printf '%s' "$out" | grep -q 'inode 陷阱'; }
+  verdict $? "rc=$rc（宿主模式应静默放行）"
+}
+
 # ── 主流程 ──────────────────────────────────────────────────────────────────
 preflight
 
@@ -575,11 +675,17 @@ if want A2; then
   case_no_deps_flag; case_upgrade_no_autodeps
   case_arg_missing_value; case_huge_numbers
   case_mem_too_small; case_bad_caddy_mode
+  case_inode_trap_prefly
 fi
 
 if want default; then
   printf '\n%s[B] 默认值路径与幂等%s\n' "$FG_B" "$FG_O"
   case_install_nodomain; case_rerun_idempotent; case_domains_absent_without_flag; case_corrupt_state_file
+fi
+
+if want default; then
+  printf '\n%s[B4] 反代文件可见性（inode 陷阱回归）%s\n' "$FG_B" "$FG_O"
+  case_inode_trap_guard
 fi
 
 if want state; then
