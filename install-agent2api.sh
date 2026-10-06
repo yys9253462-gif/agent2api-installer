@@ -24,7 +24,7 @@
 #
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.7.1"
+SCRIPT_VERSION="1.8.0"
 DEFAULT_IMAGE_REPO="aimodcc/agent2api"
 DEFAULT_TAG="2.9.1"          # 离线兜底用的「已知可用版本」（只在查不到 Docker Hub 时才用；线上实测 healthy）
 DEFAULT_DIR="/opt/agent2api"
@@ -1609,9 +1609,83 @@ apply_domain() {
     die "已回滚。"
   fi
   ok "Caddy 已重载（未重启容器、未断现有连接）"
+
+  # 🔴 关键补漏：宿主 validate/reload 通过 ≠ 容器读到了同一份文件。
+  #    详见 verify_caddyfile_visible_in_container 的注释（inode 陷阱，实测踩过）。
+  if ! verify_caddyfile_visible_in_container; then
+    problem "容器内看不到刚写入的站点块，证书不可能签出来"
+    info "正在回滚到改动前状态"
+    cp "$BACKUP_FILE" "$CADDY_FILE"
+    docker restart "${CADDY_CONTAINER:-$CADDY_SELF_CONTAINER}" >/dev/null 2>&1 || true
+    die "已回滚（站点块未生效）。请检查上方提示后重跑。"
+  fi
+
   CADDY_BACKED_UP=0        # 走到这里说明改动已完成，撤掉中断回滚的保护
 
   verify_tls
+}
+
+# 校验「宿主写进去的 Caddyfile」是否真的被反代容器读到。
+# 🔴 为什么必须单独校验：宿主上跑 caddy validate 只能证明**宿主那份文件**语法正确，
+#    完全不能证明**容器里那份**也是同一份内容。Caddy 装在容器里时，
+#    Caddyfile 是**单文件 bind mount**，Docker 按 **inode** 绑定；
+#    而脚本改写文件用的是「写临时文件 → mv 替换」的原子写法，会产生**新 inode**，
+#    容器仍盯着已被替换掉的旧 inode → 容器内读到的是改名瞬间的空壳。
+#    实测踩过：宿主 47 行完整站点块，容器内 1 行（只剩注释头），
+#    Caddy 日志零证书记录、80/443 在监听但公网访问 503。
+#    现场判据：宿主 inode ≠ 容器 inode，且宿主 md5 ≠ 容器 md5。
+verify_caddyfile_visible_in_container() {
+  # 只有「反代在容器里」时才需要这层校验：宿主模式没有 bind mount 问题
+  case "$CADDY_MODE" in
+    docker|self) : ;;
+    *) return 0 ;;
+  esac
+  [ "$DRY_RUN" = 1 ] && return 0
+
+  local cn="$CADDY_CONTAINER"
+  [ "$CADDY_MODE" = "self" ] && cn="$CADDY_SELF_CONTAINER"
+  [ -n "$cn" ] || return 0
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$cn" || return 0
+
+  # 找到 Caddyfile 在容器内的路径（self 模式固定 /etc/caddy/Caddyfile；
+  # 复用已有 Caddy 时用之前定位到的 CADDY_INNER）
+  local inner="${CADDY_INNER:-/etc/caddy/Caddyfile}"
+  [ -n "$inner" ] || inner="/etc/caddy/Caddyfile"
+
+  local host_md5 ctr_md5
+  host_md5=$(md5sum "$CADDY_FILE" 2>/dev/null | awk '{print $1}')
+  ctr_md5=$(docker exec "$cn" md5sum "$inner" 2>/dev/null | awk '{print $1}')
+
+  # 读不到容器内文件（例如路径不同）时不误报，交给下面的 reload 结果说话
+  [ -n "$ctr_md5" ] || return 0
+  [ "$host_md5" = "$ctr_md5" ] && return 0
+
+  # ── 命中 inode 陷阱：重启容器让它重新绑定当前 inode ──
+  warn "反代容器读到的 Caddyfile 与宿主不一致（单文件 bind mount 的 inode 陷阱）"
+  info "  宿主：${host_md5:0:12}…  容器：${ctr_md5:0:12}…"
+  info "  宿主 inode=$(stat -c '%i' "$CADDY_FILE" 2>/dev/null)  容器 inode=$(docker exec "$cn" stat -c '%i' "$inner" 2>/dev/null)"
+  info "  正在重启 ${cn} 让它重新绑定当前 inode…"
+
+  if docker restart "$cn" >/dev/null 2>&1; then
+    # 等容器内文件与宿主一致（最多 20 秒）
+    local i
+    for i in $(seq 1 10); do
+      ctr_md5=$(docker exec "$cn" md5sum "$inner" 2>/dev/null | awk '{print $1}')
+      [ "$ctr_md5" = "$host_md5" ] && break
+      sleep 2
+    done
+  fi
+
+  if [ "$ctr_md5" = "$host_md5" ]; then
+    ok "已重新绑定：容器内 Caddyfile 与宿主一致（md5 ${host_md5:0:12}…）"
+    return 0
+  fi
+
+  problem "重启后容器内 Caddyfile 仍与宿主不一致"
+  info "  · 容器：${cn}  容器内路径：${inner}"
+  info "  · 手工核对：docker exec ${cn} cat ${inner}"
+  info "  · 若长期不一致，改用「目录挂载」替代单文件挂载（改 compose 的 volumes）"
+  return 1
 }
 
 verify_tls() {
@@ -1634,6 +1708,9 @@ verify_tls() {
     info "  · 域名没解析到本机（Let's Encrypt 需从公网访问 80/443）"
     info "  · 云安全组 / 防火墙没放通 80、443"
     info "  · 80/443 上跑的不是本脚本配置的 Caddy"
+    info "  · 🔴 反代容器读到的 Caddyfile 是空的（单文件 bind mount 的 inode 陷阱）——"
+    info "     判据：docker exec <caddy> cat /etc/caddy/Caddyfile 只有一行注释头"
+    info "     修法：docker restart <caddy容器> 让它重新绑定当前 inode"
     info "  · 证书还在签发中：docker logs ${CADDY_CONTAINER:-${CADDY_SELF_CONTAINER:-<caddy>}} 2>&1 | tail -20"
     return 1
   fi
