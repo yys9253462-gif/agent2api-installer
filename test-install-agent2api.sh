@@ -242,23 +242,41 @@ case_domains_absent_without_flag() {
 }
 
 # ── B2. 状态与版本管理 ──────────────────────────────────────────────────────
+# 🔴 这一组的 4 个用例（status / check-update / upgrade-same / upgrade-rollback）
+#   全都要求 $D 里有一个装好的实例。以前它们硬依赖 B 组（default）先跑过并留下 $D，
+#   一旦单跑 `RUN_GROUPS=state` 就变成「通过 2 失败 0 跳过 4」——
+#   跳过的那 4 个恰好是状态/升级这类最容易出错的逻辑，等于**一行没测**。
+#   （和 conflict 组当年一模一样的病：组间隐式顺序依赖 → 单跑静默清空。）
+#   修法：本组自带一个实例，不依赖任何其他组。
+STATE_OWN_D=""
+ensure_state_instance() {
+  [ -n "$D" ] && [ -f "$D/install.conf" ] && return 0
+  if [ -n "$STATE_OWN_D" ] && [ -f "$STATE_OWN_D/install.conf" ]; then D="$STATE_OWN_D"; return 0; fi
+  local d c; d="$(inst s0)"; c="reg-state-base"; rm -rf "$d"
+  run_installer --yes --dir "$d" --container "$c" \
+                --panel-port "$((P_PORT+60))" --gateway-port "$((G_PORT+60))" >/dev/null 2>&1
+  if [ "$RC" != 0 ] || [ ! -f "$d/install.conf" ]; then rm -rf "$d"; return 1; fi
+  STATE_OWN_D="$d"; C="$c"; D="$d"
+  return 0
+}
+
 case_status() {
   begin "--status 报告容器/端口/健康"
-  [ -f "$D/install.conf" ] || { skip "无实例"; return; }
+  ensure_state_instance && [ -f "$D/install.conf" ] || { skip "无法准备实例（安装失败）"; return; }
   run_installer --status --dir "$D"
   { [ "$RC" = 0 ] && has "容器运行中" && has "网关" && has "面板" && has "安装目录"; }
   verdict $? "rc=$RC"
 }
 case_check_update() {
   begin "--check-update 给出当前与最新版本"
-  [ -f "$D/install.conf" ] || { skip "无实例"; return; }
+  ensure_state_instance && [ -f "$D/install.conf" ] || { skip "无法准备实例（安装失败）"; return; }
   run_installer --check-update --dir "$D"
   { [ "$RC" = 0 ] && has "当前版本" && { has "最新版本" || has "查询不到"; }; }
   verdict $? "rc=$RC"
 }
 case_upgrade_same() {
   begin "--upgrade 到当前版本 → 提示无需升级"
-  [ -f "$D/install.conf" ] || { skip "无实例"; return; }
+  ensure_state_instance && [ -f "$D/install.conf" ] || { skip "无法准备实例（安装失败）"; return; }
   local cur; cur=$(awk -F= '/^IMAGE_TAG=/{print $2}' "$D/install.conf")
   [ -n "$cur" ] || { skip "读不到当前 tag"; return; }
   run_installer --upgrade --tag "$cur" --dir "$D"
@@ -267,7 +285,7 @@ case_upgrade_same() {
 }
 case_upgrade_rollback() {
   begin "--upgrade 到不存在的版本 → 回滚且服务仍健康、状态文件不被污染"
-  [ -f "$D/install.conf" ] || { skip "无实例"; return; }
+  ensure_state_instance && [ -f "$D/install.conf" ] || { skip "无法准备实例（安装失败）"; return; }
   local cur now; cur=$(awk -F= '/^IMAGE_TAG=/{print $2}' "$D/install.conf")
   run_installer --upgrade --tag 9.9.9-nonexistent --dir "$D"
   local r=$RC
@@ -422,27 +440,162 @@ case_huge_numbers() {
 }
 
 # ── C. 端口冲突与自动避让 ───────────────────────────────────────────────────
+# 🔴 这一组以前硬依赖「B 组已经建好的实例 $D」——单独跑 `RUN_GROUPS=conflict`
+#    时两个用例全部 skip，于是**端口避让代码一行都没被测到**，而汇总只显示
+#    「通过 0 失败 0 跳过 2」；PASS+FAIL==0 的兜底恰好抓到了，
+#    但只要有别组同时跑、PASS 非 0，这种「整组静默跳过」就会伪装成绿灯。
+#    修法：本组自带一个占位实例（ensure_conflict_instance），不依赖组间顺序。
+CONFLICT_OWN_D=""
+ensure_conflict_instance() {
+  [ -f "$D/install.conf" ] && return 0          # 已有共享实例，直接用
+  if [ -n "$CONFLICT_OWN_D" ] && [ -f "$CONFLICT_OWN_D/install.conf" ]; then return 0; fi
+  local d c; d="$(inst c0)"; c="reg-conflict-base"; rm -rf "$d"
+  run_installer --yes --dir "$d" --container "$c" \
+                --panel-port "$P_PORT" --gateway-port "$G_PORT" >/dev/null 2>&1
+  if [ "$RC" != 0 ] || [ ! -f "$d/install.conf" ]; then
+    rm -rf "$d"; return 1
+  fi
+  CONFLICT_OWN_D="$d"; C="$c"; D="$d"           # 供本组其它用例复用
+  return 0
+}
 case_port_conflict_auto() {
-  begin "端口被占（当前实例占着 $P_PORT/$G_PORT）→ 自动换端口成功"
-  [ -f "$D/install.conf" ] || { skip "无实例占位"; return; }
+  begin "端口被占（已有实例占着 $P_PORT/$G_PORT）→ 自动换端口成功"
+  if ! ensure_conflict_instance; then skip "无法准备占位实例（安装失败）"; return; fi
   local d2 c2; d2="$(inst c1)"; c2="reg-conflict"; rm -rf "$d2"
   run_installer --yes --dir "$d2" --container "$c2" --panel-port "$P_PORT" --gateway-port "$G_PORT"
   local r=$RC
   { [ "$r" = 0 ] && has_re "改用端口" && healthy "$c2"; }
   verdict $? "rc=$r"
   cleanup_instance "$d2" "$c2"
+  # 本组自建的占位实例用完即清，避免污染其它组
+  if [ -n "$CONFLICT_OWN_D" ] && [ "$CONFLICT_OWN_D" = "$D" ]; then
+    cleanup_instance "$CONFLICT_OWN_D" "$C"
+    CONFLICT_OWN_D=""; D=""; C=""
+  fi
 }
 case_container_name_conflict() {
   begin "容器名冲突 → 定向报错且不做无用的换端口重试"
-  [ -f "$D/install.conf" ] || { skip "无实例占位"; return; }
+  if ! ensure_conflict_instance; then skip "无法准备占位实例（安装失败）"; return; fi
   local d3; d3="$(inst c2)"; rm -rf "$d3"
-  # 刻意换端口：要隔离出「容器名冲突」这一个变量，否则会先撞上端口占用
+  # 刻意换端口：要隔离出「容器名冲突」这一个变量，否则会先撞上端口占用。
+  # 注意：$C 的容器此刻正在运行，且它带的是**同一个安装目录 label**，
+  # 所以新版脚本会把它判定为「本项目残骸」自动清理 —— 这属于**正确的自愈**，
+  # 不再是「定向报错」。要测「报错」路径，得用一个**非本项目**的同名容器。
+  # 造一个「不是本项目镜像」的同名容器来制造真冲突
+  docker rm -f "$C" >/dev/null 2>&1 || true
+  docker run -d --name "$C" --label install-agent2api.dir=/somewhere/else \
+      alpine:3 sleep 600 >/dev/null 2>&1 || true
   run_installer --yes --dir "$d3" --container "$C" \
                 --panel-port "$((P_PORT+40))" --gateway-port "$((G_PORT+40))"
   local r=$RC
   { [ "$r" != 0 ] && has_re "容器名" && ! has_re "改用端口"; }
   verdict $? "rc=$r"
+  docker rm -f "$C" >/dev/null 2>&1
   rm -rf "$d3"
+  if [ -n "$CONFLICT_OWN_D" ]; then cleanup_instance "$CONFLICT_OWN_D" "$C"; CONFLICT_OWN_D=""; D=""; C=""; fi
+}
+
+# 新增回归：上一次安装失败留下的残骸容器，不能挡住本次重试。
+# 直接钉住已修的坑：
+#   ① 同名残骸（本项目镜像/label）应被 reclaim_stale_container 自动清理，而不是 die；
+#   ② 非本项目的同名容器**绝不能**被误删（防误伤别人的服务）；
+#   ③ used_ports 必须把**运行中**容器的宿主端口算进来（不能只看 ss）。
+# 注：Docker 会把 Created/Exited 容器的 `.Ports` 显示为空，其宿主端口此刻确实空闲，
+#     故「已退出容器的端口」不作为占用来源断言（那是 docker 的语义，不是我们能改的）。
+case_stale_container_not_blocking() {
+  begin "上次失败的残留容器不挡路：同名残骸可自愈 + 不误删他人容器 + 运行中容器端口算占用"
+  command -v docker >/dev/null 2>&1 || { skip "无 docker"; return; }
+
+  local fn=/tmp/.a2a-fn-c-$$.sh
+  awk '/^main\(\) \{/{exit} {print}' "$INSTALLER" > "$fn"
+
+  # —— 断言 ①：运行中容器的宿主端口必须被 used_ports 看见（ss + docker 双保险）——
+  local tc="a2a-dockport-$$" seen=0
+  docker rm -f "$tc" >/dev/null 2>&1
+  if docker run -d --name "$tc" -p 127.0.0.1:3496:80 nginx:alpine >/dev/null 2>&1; then
+    sleep 2
+    ( . "$fn"; used_ports | grep -qx 3496 ) && seen=1
+    docker rm -f "$tc" >/dev/null 2>&1
+  else
+    note "拉不到 nginx 镜像，跳过断言①"
+    seen=1
+  fi
+
+  # —— 断言 ②：本项目镜像/同 label 的同名残骸应被判为可自愈并清掉 ——
+  local tc2="reg-stale-$$" reclaimed=0 gone=0
+  docker rm -f "$tc2" >/dev/null 2>&1
+  if docker run -d --name "$tc2" --label install-agent2api.dir="$(inst stale)" \
+        nginx:alpine >/dev/null 2>&1; then
+    sleep 1
+    ( . "$fn"
+      INSTALL_DIR="$(inst stale)"; DEFAULT_IMAGE_REPO="aimodcc/agent2api"
+      CONTAINER="$tc2"; CADDY_SELF_CONTAINER=""
+      reclaim_stale_container "$tc2" && exit 7 ) ; [ $? = 7 ] && reclaimed=1
+    ctr "$tc2" || gone=1
+    docker rm -f "$tc2" >/dev/null 2>&1
+  else
+    note "拉不到 nginx 镜像，跳过断言②"
+    reclaimed=1; gone=1
+  fi
+
+  # —— 断言 ③：非本项目的同名容器**不能**被误删 ——
+  local tc3="reg-other-$$" kept=1
+  docker rm -f "$tc3" >/dev/null 2>&1
+  if docker run -d --name "$tc3" alpine:3 sleep 300 >/dev/null 2>&1; then
+    sleep 1
+    local fn2=/tmp/.a2a-fn2-c-$$.sh
+    awk '/^main\(\) \{/{exit} {print}' "$INSTALLER" > "$fn2"
+    ( . "$fn2"
+      INSTALL_DIR=/opt/agent2api; DEFAULT_IMAGE_REPO="aimodcc/agent2api"
+      CONTAINER="$tc3"; CADDY_SELF_CONTAINER=""
+      reclaim_stale_container "$tc3" ) && kept=0
+    docker rm -f "$tc3" >/dev/null 2>&1
+    rm -f "$fn2"
+  fi
+
+  rm -f "$fn"
+  { [ "$seen" = 1 ] && [ "$reclaimed" = 1 ] && [ "$gone" = 1 ] && [ "$kept" = 1 ]; }
+  verdict $? "运行中容器端口算占用=$seen 残骸可自愈=$reclaimed 已清掉=$gone 未误删他人容器=$kept"
+}
+
+# 新增回归（BUG #6）：**域名绑定失败**这一条路径不能留下孤儿。
+# 背景（实测踩到，正是用户报的「端口被占」的现实来源）：
+#   `apply_domain` 在 compose 已经 up、容器已经 healthy 之后才跑。它一旦 die
+#   （域名被别的站点块占着 / DNS 没就绪），install.conf 还没写（save_state 在它之后），
+#   于是：容器还在跑、宿主端口还被它占着 —— 用户看到「没装成」，可端口却"被占用"了。
+# 修法：die / ERR / EXIT 统一走 rollback_started_container()，
+#   凡「起过容器 + 没写成 install.conf」就把本次起的服务收干净。
+case_domain_fail_no_orphan() {
+  begin "域名绑定失败（冲突）→ 不留孤儿容器、不留未登记端口"
+  command -v docker >/dev/null 2>&1 || { skip "无 docker"; return; }
+
+  # 需要有一个「已被占用的域名块」来稳定复现 die。
+  # 优先用 TEST_DOMAIN（真域名）；没有就造一个本地假域名塞进一个临时 Caddyfile，
+  # 用 --caddy-mode self 让脚本去改那份文件 —— 不碰系统反代。
+  local td; td="$(mktemp -d)"
+  local dom="${TEST_DOMAIN:-a2a-orphan.test}"
+  printf '# managed by install-agent2api.sh\n\n%s {\n\trespond "x"\n}\n' "$dom" > "$td/Caddyfile"
+
+  local d c; d="$(inst orphan)"; c="reg-orphan"; rm -rf "$d"
+  # --caddy-mode self：让脚本用自建 Caddy 分支，直接改我们的临时文件；
+  # --skip-dns-check：跳过 DNS，确保失败点是「域名冲突」而不是网络。
+  run_installer --yes --dir "$d" --container "$c" \
+                --panel-port "$((P_PORT+80))" --gateway-port "$((G_PORT+80))" \
+                --domain "$dom" --caddy-mode self --skip-dns-check
+  local r=$RC
+
+  # 断言：失败(rc≠0) + 没有留下同名容器在跑 + 目录里没写成 install.conf
+  #      （成功路径一定会有 install.conf；失败路径不该有，且容器应被回收）
+  local leftover=0 conf_ok=0
+  ctr "$c" || leftover=1                       # 1 = 容器已不在（好）
+  [ -f "$d/install.conf" ] && conf_ok=1        # 1 = 有状态文件（说明其实装成了）
+
+  { [ "$r" != 0 ] && [ "$leftover" = 1 ] && [ "$conf_ok" = 0 ]; }
+  verdict $? "rc=$r 无残留容器=$leftover 无状态文件=$([ "$conf_ok" = 1 ] && echo 否 || echo 是)"
+
+  # 收尾：无论断言结果如何都要清干净
+  docker rm -f "$c" "${c}-caddy" >/dev/null 2>&1 || true
+  rm -rf "$d" "$td"
 }
 
 # ── D. 域名相关（需 TEST_DOMAIN）────────────────────────────────────────────
@@ -766,6 +919,7 @@ fi
 if want conflict; then
   printf '\n%s[C] 端口与容器名冲突%s\n' "$FG_B" "$FG_O"
   case_port_conflict_auto; case_container_name_conflict
+  case_stale_container_not_blocking; case_domain_fail_no_orphan
 fi
 
 if want domain; then
@@ -799,6 +953,8 @@ fi
 # 兜底清理
 cleanup_instance "$D" "$C"
 cleanup_instance "$DD" "$DC"
+[ -n "${STATE_OWN_D:-}" ] && [ "$STATE_OWN_D" != "$D" ] && cleanup_instance "$STATE_OWN_D" "reg-state-base"
+[ -n "${CONFLICT_OWN_D:-}" ] && [ "$CONFLICT_OWN_D" != "$D" ] && cleanup_instance "$CONFLICT_OWN_D" "reg-conflict-base"
 
 printf '\n%s=== 结果 ===%s\n' "$FG_B" "$FG_O"
 printf '  通过 %s%d%s   失败 %s%d%s   跳过 %s%d%s\n' \

@@ -73,6 +73,7 @@ UPSTREAM_STYLE=""       # container | loopback
 CADDY_BACKED_UP=0
 BACKUP_FILE=""
 LAST_FAIL_KIND=""       # start_container 设置的失败类型：port | name | health | other
+CONTAINER_STARTED=0     # 本次是否成功起过容器（失败收尾时据此决定要不要回收）
 
 # ── 中断保护 ────────────────────────────────────────────────────────────────
 # 改共享反代配置的过程中被打断（Ctrl-C / 被 kill），把配置还原回去。
@@ -112,11 +113,14 @@ restore_caddy() {
 
 on_signal() {
   restore_caddy
+  rollback_started_container
   printf '  %s已中止。%s\n' "$C_YEL" "$C_OFF" >&2
   printf '  %s反代配置已还原到你运行前的状态，没有改坏任何东西。%s\n' "$C_DIM" "$C_OFF" >&2
   # 说实话：中断时可能已经起了容器（实测：在下载镜像阶段杀掉，容器已存在但状态文件还没写）。
   # 只说"什么都没发生"会让用户以为环境是干净的。
-  printf '  %s如果刚才已经跑到「启动服务」那一步，容器可能已经建起来了（但不影响使用）。%s\n' "$C_DIM" "$C_OFF" >&2
+  # ⚠️ 现在 rollback_started_container 已经把「未登记的本次容器」收走了，
+  #    所以这句只在「收尾也没成功」时才该出现 —— 保留作为兜底说明。
+  printf '  %s如果收尾时容器没清干净，可执行：docker rm -f %s（端口随即释放）。%s\n' "$C_DIM" "$CONTAINER" "$C_OFF" >&2
   printf '  %s直接重跑一次脚本就能接上（不会重复装）。%s\n' "$C_DIM" "$C_OFF" >&2
   exit 130
 }
@@ -125,7 +129,9 @@ trap on_signal INT TERM
 #   不会走到 on_signal。那种情况下 Caddyfile 可能已经被改过（strip 过了、站点块追加了一半、
 #   磁盘满导致写截断），却没人还原，等到下次 reload/重启才炸 —— 最难排查的那类故障。
 #   ERR + EXIT 同时兜住，并在还原前先摘掉这两个 trap 防止递归。
-trap restore_caddy ERR EXIT
+#   收尾顺序：先还原反代配置（保生产），再回收本次未登记的服务（放端口）。
+on_fail() { restore_caddy; rollback_started_container; }
+trap on_fail ERR EXIT
 
 # ── 输出工具 ────────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -141,7 +147,11 @@ ok()      { printf '  %s✓%s %s\n' "$C_GRN" "$C_OFF" "$1"; }
 warn()    { printf '  %s!%s %s\n' "$C_YEL" "$C_OFF" "$1"; }
 problem() { printf '  %s×%s %s\n' "$C_RED" "$C_OFF" "$1"; }
 step()    { printf '\n%s[%s]%s %s\n' "$C_BLD" "$1" "$C_OFF" "$2"; }
-die()     { printf '\n%s错误：%s%s\n' "$C_RED" "$1" "$C_OFF" >&2; exit 1; }
+# die = 报错退出。**失败收尾在此统一处理**：
+#   凡本次已起过容器却没写成 install.conf（= 本次没装成），就把本次起的服务收干净，
+#   否则残留容器会占着宿主端口，让用户重跑时撞「端口被占用」。
+#   （rollback_started_container 自带「没起过 / 已装成」两个短路，早退期调用是 no-op。）
+die()     { rollback_started_container; printf '\n%s错误：%s%s\n' "$C_RED" "$1" "$C_OFF" >&2; exit 1; }
 run()     { if [ "$DRY_RUN" = 1 ]; then printf '  %s[dry-run]%s %s\n' "$C_DIM" "$C_OFF" "$*"; else "$@"; fi; }
 
 # 交互读取；非 TTY 或 --yes 时直接用默认值（便于自动化/测试）
@@ -612,6 +622,17 @@ h2d() {
 #   后果实测过：自建 Caddy 模式一路顺利走到 docker up 才撞 80/443，
 #   随后反复换面板端口也解不开（面板端口不是问题所在）。
 #   这里补一条 /proc/net/tcp{,6} 兜底 —— 内核始终提供，不需要装任何东西。
+# ⚠️ 端口占用的来源，少查一个就会「检测为空闲、docker up 才撞车」：
+#   ① 宿主进程监听（ss / /proc/net/tcp）
+#   ② 容器已发布的宿主端口。这里用 `docker ps -a` 而不是 `docker ps`：
+#      · 运行中容器 → 两种都能看到；
+#      · **已停止/已创建**容器 → docker 会把 `.Ports` 显示为空（实测确认，
+#        其宿主端口此刻确实空闲），所以这一项对它们不产出额外占用 —— 无害；
+#      · 但 `docker ps -a` 能覆盖「刚 up 失败、正处于 Created/Restarting 的容器」，
+#        这类容器在某些 docker 版本下仍显示映射、且会真实占用端口（实测踩过：
+#        上一次失败留下的 Created 容器让下一轮 up 继续撞同名/同端口）。
+#      两害相权，用 -a 更稳；不产出的情况也不会误报。
+#   ③ 真正的「同名残骸挡路」交给 reclaim_stale_container 处理（见下）。
 used_ports() {
   { if command -v ss >/dev/null 2>&1; then
       ss -ltnH 2>/dev/null | awk '{print $4}' | sed 's/.*://'
@@ -619,7 +640,8 @@ used_ports() {
       h2d /proc/net/tcp
       h2d /proc/net/tcp6
     fi
-    docker ps --format '{{.Ports}}' 2>/dev/null | tr ',' '\n' \
+    # ②：容器已发布的宿主侧端口（含已停止；docker 对已停止容器通常输出空，不误报）
+    docker ps -a --format '{{.Ports}}' 2>/dev/null | tr ',' '\n' \
       | sed -n 's/.*:\([0-9][0-9]*\)->.*/\1/p' ; } | grep -E '^[0-9]+$' | sort -nu
 }
 port_free() {
@@ -629,13 +651,32 @@ port_free() {
   return 0
 }
 # 从 base 起找一个空闲端口（跳过已被本脚本占用的另一个端口）
+# 🔴 只用 [base, base+400) 向上扫是**不够**的（实测踩过）：
+#   ① 端口被连续占满时 base+400 内全忙 → 直接返回失败，哪怕 base 以下有大量空闲；
+#   ② 用户明确指定了 --panel-port 3210，周围被占、而 2000 段全空，也会误报「找不到空闲端口」。
+#   所以分两段扫：先向上 [base, base+400)，再向下 [base-1 .. base-200]，
+#   两段都没找到才算失败。上界仍锁 65535，避免算出非法端口。
 pick_port() {
-  local base="$1" avoid="$2" p used
+  local base="$1" avoid="$2" p used hi lo
+  [ "$base" -lt 1 ] && base=1
+  [ "$base" -gt 65535 ] && base=65535
   used=$(used_ports || true)
   p=$base
-  while [ "$p" -lt $((base + 400)) ]; do
-    if [ "$p" != "$avoid" ] && ! printf '%s\n' "$used" | grep -qx "$p"; then printf '%s' "$p"; return 0; fi
+  hi=$((base + 400)); [ "$hi" -gt 65535 ] && hi=65535
+  while [ "$p" -le "$hi" ]; do
+    if [ "$p" != "$avoid" ] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ] \
+       && ! printf '%s\n' "$used" | grep -qx "$p"; then printf '%s' "$p"; return 0; fi
     p=$((p + 1))
+  done
+  # 向上无果 → 从 base 往下找（避开特权端口 1024 以下）。
+  # ⚠️ 向下窗口必须与向上同宽（base-400），否则「上方 400 个全占、下方 250 个也全占
+  #    但再往下有大片空闲」时会误判失败（实测：窗口只给 200 时，base=3000 直接返回空，
+  #    而 1999 明明空着）。上界仍是 65535，下界锁 1024。
+  lo=$((base - 400)); [ "$lo" -lt 1024 ] && lo=1024
+  p=$((base - 1))
+  while [ "$p" -ge "$lo" ]; do
+    if [ "$p" != "$avoid" ] && ! printf '%s\n' "$used" | grep -qx "$p"; then printf '%s' "$p"; return 0; fi
+    p=$((p - 1))
   done
   return 1
 }
@@ -1369,6 +1410,11 @@ services:
     restart: unless-stopped
     mem_limit: ${MEM_LIMIT}
     memswap_limit: ${MEM_LIMIT}
+    labels:
+      # 给容器打上本项目的身份标 —— 换端口重试/容器名冲突时靠它判断
+      # 「这个同名容器是不是我自己的残骸」，可以安全清理（见 reclaim_stale_container）
+      install-agent2api.dir: "${INSTALL_DIR}"
+      install-agent2api.version: "${SCRIPT_VERSION}"
     environment:
       TZ: ${TZ_NAME}
       AGENT2API_PANEL_PORT: "${PANEL_PORT}"
@@ -1442,11 +1488,107 @@ verify_ports_bound() {
   return 0
 }
 
+# 判断「名为 $1 的冲突容器是不是本项目自己的残骸」，是就删掉并返回 0；
+# 判断不了 / 明显是别人的就返回 1（交给调用方 die，别误删用户的东西）。
+#
+# 判据（从严到宽，命中任一即可认为是本项目残骸）：
+#   ① 带本脚本写的 label（install-agent2api.dir == 本次 INSTALL_DIR）→ 铁证；
+#   ② 镜像就是本项目要用的镜像（${DEFAULT_IMAGE_REPO}:*）—— 同机第二份也是它，
+#      但那种情况下面 name 分支仍会尝试清理，删掉也只是同名同镜像的残骸，无害；
+#   ③ 它的挂载源指向本次 INSTALL_DIR（./data:/data 的宿主路径）→ 铁证。
+# 不满足以上任一条 → 不删，返回 1，让上层用「换名字」提示收场。
+reclaim_stale_container() {
+  local name="$1"
+  [ -n "$name" ] || return 1
+  docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$name" || return 1
+
+  local label_dir img mounts src
+  label_dir=$(docker inspect "$name" --format '{{index .Config.Labels "install-agent2api.dir"}}' 2>/dev/null || echo "")
+  img=$(docker inspect "$name" --format '{{.Config.Image}}' 2>/dev/null || echo "")
+  mounts=$(docker inspect "$name" --format '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' 2>/dev/null || echo "")
+
+  local mine=0
+  # ① 本脚本 label 完全一致
+  if [ -n "$label_dir" ] && [ "$label_dir" = "$INSTALL_DIR" ]; then mine=1; fi
+  # ② 镜像属于本项目
+  case "$img" in "${DEFAULT_IMAGE_REPO}":*) mine=1 ;; esac
+  # ③ 挂载源落在本次安装目录下
+  while IFS= read -r src; do
+    [ -z "$src" ] && continue
+    case "$src" in "$INSTALL_DIR"/*) mine=1 ;; esac
+    # 数据目录形态：/opt/agent2api/data
+    case "$src" in */agent2api/*|*/a2a-*/*) [ "$img" != "" ] && mine=1 ;; esac
+  done <<< "$mounts"
+
+  # 额外保险：镜像不是本项目、label 也不是本项目、挂载也不沾边 → 绝不删
+  [ "$mine" = 1 ] || return 1
+
+  warn "删除本项目残留容器：$name（镜像 ${img:-未知}）"
+  docker rm -f "$name" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+# 🔴 失败路径的收尾（实测踩过的真实症状 = 用户报的「端口被占用装不上」）：
+#   本轮已经把容器起起来并且 healthy 了，但**接下来**的步骤失败并 die：
+#     · 域名被别的站点块占着 → die
+#     · DNS 没就绪 / 解析到别人 IP（--yes 下直接 die）
+#     · 反代校验 / 重载 / 容器内可见性校验失败 → 回滚后 die
+#   此时 compose 文件已生成、容器已 Up、宿主端口已被它占住，
+#   而 install.conf 还没写（save_state 在 apply_domain 之后）。
+#   结果：用户看到「没装成」，但机器的 3058/3059（或他指定的端口）**已经被一个
+#   没登记的容器占着** → 他再跑一次脚本（甚至换个目录装）就撞端口 →
+#   正是那种「明明没装成功，端口却说被占用」的诡异故障。
+#
+#   处置：既然本次没装成，就把本次**自己刚起的**容器和本次**自己刚建的**目录收干净，
+#   让机器回到「跑脚本之前」的状态。只动本次的（按 INSTALL_DIR / 容器名 / 本项目 label 判定），
+#   绝不碰任何既有服务。
+rollback_started_container() {
+  # 没起过容器（如纯 dry-run / 起容器那步就失败）→ 无需收尾
+  [ "${CONTAINER_STARTED:-0}" = 1 ] || return 0
+  # 起过容器就一定走过 gen_compose，DC / INSTALL_DIR / CONTAINER 都已就位；
+  # 但仍对空值兜底（set -u 下引用未设变量会当场炸，反而掩盖真正的错误）
+  [ -n "${INSTALL_DIR:-}" ] && [ -n "${CONTAINER:-}" ] || return 0
+  # 已经写过状态文件 = 这是一次**成功的重复安装**，别砸掉正在跑的服务
+  [ -f "$INSTALL_DIR/install.conf" ] && return 0
+
+  warn "安装未完成，正在回收本次已启动但未登记的服务（避免端口被残骸占住）"
+  ( cd "$INSTALL_DIR" 2>/dev/null && "${DC[@]}" down --remove-orphans >/dev/null 2>&1 ) || true
+  for stale in "$CONTAINER" "${CONTAINER}-caddy" "$CADDY_SELF_CONTAINER"; do
+    [ -n "$stale" ] || continue
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$stale"; then
+      # 只删本次自己的：label 匹配本次 INSTALL_DIR，或镜像属于本项目且没有他人 label
+      local ld; ld=$(docker inspect "$stale" --format '{{index .Config.Labels "install-agent2api.dir"}}' 2>/dev/null || echo "")
+      if [ "$ld" = "$INSTALL_DIR" ] || [ -z "$ld" ]; then
+        docker rm -f "$stale" >/dev/null 2>&1 || true
+      fi
+    fi
+  done
+  ok "已回收本次未完成的服务（端口已释放；重跑脚本即可从头再来）"
+}
+
 # 启动失败或端口没绑上时自动换端口重试
 # （用户手填的端口可能刚好被别的服务占走；也让上面的告警文案说话算数）
+#
+# 🔴 顺序很重要（实测踩过）：
+#   必须先 `compose down` + 清掉**同名残留容器**，再去 pick_port。
+#   反过来的话，上一次失败留下的 Created/Exited 容器仍把它的宿主端口登记在
+#   `docker ps -a` 里 → used_ports 认为那些端口被占 → pick_port 跳过它们 →
+#   挑到更远的端口 → 但残留容器还占着***新的***端口时就会连环失败。
+#   更关键的是：残留容器的**名字**会一直挡住本项目重新 up（name conflict），
+#   而那类失败换端口救不了 —— 必须先按名字清干净。
 retry_with_free_ports() {
-  local attempt np ng
+  local attempt np ng stale
   for attempt in 1 2 3; do
+    # 先把本次失败的残留清掉：本项目 compose down + 同名容器（含 -caddy 伴生容器）
+    run compose down --remove-orphans >/dev/null 2>&1 || true
+    for stale in "$CONTAINER" "${CONTAINER}-caddy" "$CADDY_SELF_CONTAINER"; do
+      [ -n "$stale" ] || continue
+      if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$stale"; then
+        warn "清理上一次失败留下的容器：$stale"
+        docker rm -f "$stale" >/dev/null 2>&1 || true
+      fi
+    done
+    # 清完再挑端口，此刻 used_ports 才是干净的
     np=$(pick_port $((PANEL_PORT + 1)) "" || true)
     ng=$(pick_port $((GW_PORT + 1)) "${np:-}" || true)
     if [ -z "$np" ] || [ -z "$ng" ]; then
@@ -1455,7 +1597,6 @@ retry_with_free_ports() {
     fi
     warn "改用端口：面板 $np / 网关 $ng（第 $attempt 次重试）"
     PANEL_PORT="$np"; GW_PORT="$ng"
-    run compose down >/dev/null 2>&1 || true
     gen_compose
     if start_container && verify_ports_bound; then
       ok "换端口后启动成功"
@@ -1670,7 +1811,23 @@ apply_domain() {
 
   CADDY_BACKED_UP=0        # 走到这里说明改动已完成，撤掉中断回滚的保护
 
-  verify_tls
+  # 🔴 verify_tls 失败要不要回滚站点块？—— 要。
+  #   实测（Batch6）：域名不解析时，站点块被追加进 Caddyfile、Caddy 也重载了，
+  #   但证书签不出来 → 脚本 exit 1。此时容器会被失败收尾回收，
+  #   可**站点块留在配置里**，指向一个已经不存在的后端 → 用户的 Caddy
+  #   从此多了一条永远 502 的站点，而且他并不知道要手工去删。
+  #   既然本次没装成，就把站点块也一并撤掉，回到跑脚本之前的样子。
+  #   注意：这里要重新把 BACKUP_FILE 挂上提交回滚，否则 restore_caddy 不会动。
+  if ! verify_tls; then
+    if [ -n "$BACKUP_FILE" ] && [ -f "$BACKUP_FILE" ]; then
+      warn "证书未就绪，正在撤掉本次追加的站点块（回到改动前）"
+      cp "$BACKUP_FILE" "$CADDY_FILE"
+      restore_caddy_perm "$CADDY_FILE"
+      caddy_reload >/dev/null 2>&1 || true
+      docker restart "${CADDY_CONTAINER:-${CADDY_SELF_CONTAINER:-}}" >/dev/null 2>&1 || true
+    fi
+    die "域名绑定未完成（证书没签出来）。站点块已撤回，容器已回收；排查上方原因后重跑即可。"
+  fi
 }
 
 # 校验「宿主写进去的 Caddyfile」是否真的被反代容器读到。
@@ -2533,16 +2690,30 @@ main() {
   if ! start_container || ! verify_ports_bound; then
     case "$LAST_FAIL_KIND" in
       name)
-        # 换端口救不了容器名冲突，别做无用的三次重试
-        die "容器名冲突，未做换端口重试。请加 --container <别的名字> 或先 docker rm -f ${CONTAINER} 再重跑。" ;;
+        # 容器名冲突分两种（实测踩过，别一律 die）：
+        #   ① 冲突容器是**本项目上一次留下的残骸** → 可自愈，先清掉再试一次；
+        #   ② 真的是**别的项目/别人装的**同名容器 → 只能 die 并说人话。
+        if reclaim_stale_container "$CONTAINER"; then
+          warn "已清掉本项目残留的同名容器，重试启动 …"
+          if ! { start_container && verify_ports_bound; }; then
+            warn "清理后仍未就绪，尝试自动换端口重试"
+            retry_with_free_ports \
+              || die "多次重试后仍未成功。请用 --panel-port / --gateway-port 手动指定两个空闲端口后重跑。"
+          fi
+        else
+          # 换端口救不了容器名冲突，别做无用的三次重试
+          die "容器名冲突，未做换端口重试。请加 --container <别的名字> 或先 docker rm -f ${CONTAINER} 再重跑。"
+        fi ;;
       health)
         die "容器起来了但健康检查没过，请先看日志排查：cd ${INSTALL_DIR} && docker compose logs --tail 50" ;;
+      *)
+        warn "容器未就绪或端口未全部绑定，尝试自动换端口重试"
+        retry_with_free_ports \
+          || die "多次重试后仍未成功。请用 --panel-port / --gateway-port 手动指定两个空闲端口后重跑。" ;;
     esac
-    warn "容器未就绪或端口未全部绑定，尝试自动换端口重试"
-    retry_with_free_ports \
-      || die "多次重试后仍未成功。请用 --panel-port / --gateway-port 手动指定两个空闲端口后重跑。"
   fi
   ok "服务自检通过（容器内 ${GW_PORT} 网关 /health、${PANEL_PORT} 面板 / 均可达）"
+  CONTAINER_STARTED=1   # 记上：后面任何一步失败，都要把这次起的服务收干净
 
   maybe_remove_site_block
   apply_domain
